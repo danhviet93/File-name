@@ -65,6 +65,28 @@ def _merge_line(items, vx, vy):
             if segs_[i][1] <= c <= segs_[i][2]:
                 return True
         return False
+    def along(s):
+        d = s["dir"]
+        return s["rect"].x0 * d[0] + s["rect"].y0 * d[1] if abs(d[0]) > 0.9 or abs(d[1]) > 0.9 else 0
+    def perp(s):                                   # position de la ligne de base (centre perpendiculaire)
+        d = s["dir"]
+        return ((s["rect"].y0 + s["rect"].y1) / 2) if abs(d[0]) >= abs(d[1]) else ((s["rect"].x0 + s["rect"].x1) / 2)
+    # morceaux écrits séparément (lettre de couleur différente...) : on les regroupe par ligne de base
+    order = sorted(items, key=lambda s: (s["dir"], perp(s)))
+    lines, cur = [], []
+    for s in order:
+        if cur and (cur[0]["dir"] != s["dir"] or abs(perp(cur[0]) - perp(s)) > 0.3 * max(cur[0]["size"], s["size"])):
+            lines.append(cur); cur = []
+        cur.append(s)
+    if cur:
+        lines.append(cur)
+    res = []
+    for ln in lines:
+        ln.sort(key=along)
+        res.extend(_merge_run(ln, crossed))
+    return res
+
+def _merge_run(items, crossed):
     out = []
     for s in items:
         p = out[-1] if out else None
@@ -77,7 +99,8 @@ def _merge_line(items, vx, vy):
             else:
                 gap = None
             sz = max(p["size"], s["size"])
-            if gap is not None and -0.5 * sz <= gap <= 1.2 * sz and not crossed(p, s, d):
+            low = -0.8 * sz if p.get("sp_after") else -0.5 * sz   # la boîte inclut l'espace final: chevauchement normal
+            if gap is not None and low <= gap <= 1.2 * sz and not crossed(p, s, d):
                 n1, n2 = len(p["text"]), len(s["text"])
                 space = gap > 0.1 * sz or p.get("sp_after") or s.get("sp_before")
                 p["text"] = p["text"] + (" " if space else "") + s["text"]
@@ -151,34 +174,30 @@ def _page_data(pg, textpage=None):
         for l in b.get("lines", []):
             dx, dy = l["dir"]
             d = (round(ma * dx + mc * dy, 3), round(mb * dx + md * dy, 3))
-            line = []
             for s in l["spans"]:
                 t = s["text"]
                 if any(ord(c) < 32 and c not in "\t\n\r" for c in t):
                     garbled.add(s["font"])
-                line.append(s)
-            raw.append((line, d))
+                raw.append((s, d))
     vx = sorted((x0, min(y0, y1), max(y0, y1)) for x0, y0, x1, y1 in segs if abs(x0 - x1) < 1)
     vy = sorted((y0, min(x0, x1), max(x0, x1)) for x0, y0, x1, y1 in segs if abs(y0 - y1) < 1)
     vx, vy = (vx, [v[0] for v in vx]), (vy, [v[0] for v in vy])
-    spans = []
-    for line, d in raw:
-        items = []
-        for s in line:
-            t = s["text"]
-            if s["font"] in garbled:
-                t = _decode(t)
-            t = " ".join(t.split())
-            if not t:
-                continue
-            r = pymupdf.Rect(s["bbox"]) * M; r.normalize()
-            c = s["color"]
-            lum = (((c >> 16) & 255) * 0.3 + ((c >> 8) & 255) * 0.59 + (c & 255) * 0.11) / 255
-            bold = bool(s["flags"] & 16) or "bold" in s["font"].lower() or "black" in s["font"].lower()
-            raw_t = s["text"]
-            items.append({"size": s["size"], "text": t, "rect": r, "lum": lum, "dir": d, "bold": bold,
-                          "sp_before": raw_t[:1].isspace(), "sp_after": raw_t[-1:].isspace()})
-        spans.extend(_merge_line(items, vx, vy))
+    items = []
+    for s, d in raw:
+        t = s["text"]
+        if s["font"] in garbled:
+            t = _decode(t)
+        t = " ".join(t.split())
+        if not t:
+            continue
+        r = pymupdf.Rect(s["bbox"]) * M; r.normalize()
+        c = s["color"]
+        lum = (((c >> 16) & 255) * 0.3 + ((c >> 8) & 255) * 0.59 + (c & 255) * 0.11) / 255
+        bold = bool(s["flags"] & 16) or "bold" in s["font"].lower() or "black" in s["font"].lower()
+        raw_t = s["text"]
+        items.append({"size": s["size"], "text": t, "rect": r, "lum": lum, "dir": d, "bold": bold,
+                      "sp_before": raw_t[:1].isspace(), "sp_after": raw_t[-1:].isspace()})
+    spans = _merge_line(items, vx, vy)
     return segs, spans, n_items, rects
 
 def _rot_pt(k, x, y, W, H):
@@ -422,28 +441,44 @@ def _norm(text):
     t = unicodedata.normalize("NFKD", text.lower())
     return "".join(c for c in t if not unicodedata.combining(c))
 
-def biggest_text(spans, n=5):
-    """Dernier recours: les lignes en plus grande police de la page (hors codes et mentions légales)."""
+def _body_size(spans):
+    """Taille du corps de texte = médiane pondérée par le nombre de caractères."""
+    sz = sorted((sp["size"], len(sp["text"])) for sp in spans)
+    if not sz:
+        return 0
+    half, acc = sum(n for _, n in sz) / 2, 0
+    for v, n in sz:
+        acc += n
+        if acc >= half:
+            return v
+    return sz[-1][0]
+
+def prominent_text(spans, ratio=0.7, n=10):
+    """Toutes les lignes en évidence de la page (plus grosse police, en gras un peu plus petit), dans l'ordre de lecture.
+    Sert de repli quand aucun titre n'est trouvé autrement."""
     c = []
     for sp in spans:
         t = sp["text"]
-        if len(re.findall(r"[A-Za-zÀ-ÿ]", t)) < 4 or BOILERPLATE.search(_norm(t)) or _is_label(t):
+        if len(re.findall(r"[A-Za-zÀ-ÿ]", t)) < 2 or BOILERPLATE.search(_norm(t)) or _is_label(t) or sp["lum"] > 0.85:
             continue
         if " " not in t and re.search(r"\d", t):
             continue
         c.append(sp)
+    hz = [sp for sp in c if sp["dir"][0] > 0.7]
+    c = hz or c
     if not c:
         return ""
     mx = max(sp["size"] for sp in c)
-    top = [sp for sp in c if sp["size"] >= 0.7 * mx]
-    top.sort(key=lambda sp: -sp["size"])
-    top = top[:n]
+    top = [sp for sp in c if sp["size"] >= ratio * mx or (sp["bold"] and sp["size"] >= (ratio - 0.1) * mx)]
+    top = sorted(top, key=lambda sp: -sp["size"])[:n]
     top.sort(key=lambda sp: (round(sp["rect"].y0 / (mx * 0.5)), sp["rect"].x0))
     out = []
     for sp in top:
         if sp["text"] not in out:
             out.append(sp["text"])
     return " | ".join(out)[:400]
+
+COVER_RATIO = 1.8   # document: police du titre >= 1,8 x corps du texte -> page de garde, on prend les textes en évidence
 
 def central_text(pg):
     """Documents sans cartouche (Word, présentation): ensemble des lignes en évidence au centre de la page.
@@ -494,7 +529,7 @@ def central_text(pg):
                 if ov > 0.5 * min(ra.height, rb.height) and gap > 1.5 * max(sa, sb, 6):
                     row = True
         text = " ".join(lines)
-        if len(re.findall(r"[A-Za-zÀ-ÿ]", text)) < 4:
+        if len(re.findall(r"[A-Za-zÀ-ÿ]", text)) < 3:
             continue
         r = pymupdf.Rect(b["bbox"]) * M; r.normalize()
         blocks.append({"text": text, "size": size, "bold": nb / max(1, nchar) >= 0.5, "rect": r, "row": row})
@@ -642,18 +677,35 @@ def cartouche_title(pg, hint=""):
             segs, spans, n_items, rects = _page_data(pg, tp)
             ocr = " (OCR)"
     found = find_cartouche(pg, segs, spans, rects)
+    doc = n_items <= DOC_MAX_ITEMS
     if found is None:
-        if n_items <= DOC_MAX_ITEMS and not ocr:          # document: pas de cartouche -> paragraphe central
-            t = central_text(pg)
+        if doc and not ocr:                               # document: pas de cartouche
+            body = _body_size(spans)
+            if spans and max(s["size"] for s in spans) >= COVER_RATIO * body:
+                t = prominent_text(spans)                 # page de garde: gros titre au milieu
+                if t:
+                    return t, None, "texte en évidence"
+            t = central_text(pg)                          # sinon paragraphe central
             if t:
                 return t, None, "texte central"
-        t = biggest_text(spans)
+        t = prominent_text(spans)
         if t:
-            return t, None, "gros texte (à vérifier)" + ocr
+            return t, None, "texte en évidence (à vérifier)" + ocr
         if not spans:
             return "(aucun texte - page scannée ou texte vectorisé ?)", None, "aucun texte"
         return "(cartouche non détecté)", None, "non détecté"
     k, box, (W, H, Hl, Vl, sp) = found
+    if doc:
+        # Document (page de garde Word...): le "cartouche" trouvé est souvent le tableau des révisions / signatures
+        # en bas de page. Si un texte beaucoup plus gros existe hors de ce tableau, c'est lui le titre.
+        inside = [s for s in sp if box.contains(s["rect"].tl) and box.contains(s["rect"].br)]
+        outside = [s for s in sp if not (box.contains(s["rect"].tl) and box.contains(s["rect"].br))]
+        mx_in = max((s["size"] for s in inside), default=0)
+        t = prominent_text(outside)
+        if t:
+            mx_out = max(s["size"] for s in outside if s["text"] in t.split(" | "))
+            if mx_out >= 1.5 * mx_in and (box.width >= 0.8 * W or mx_out >= 2.5 * mx_in):
+                return t, None, "texte en évidence"
     ok_all, labels = [], []
     for s in sp:
         r = s["rect"]
@@ -671,8 +723,8 @@ def cartouche_title(pg, hint=""):
             continue                                      # étiquette du cartouche ("Phase", "Indice"...), code, mention légale
         ok_all.append(s)
     if not ok_all:
-        t = biggest_text([s for s in sp if box.contains(s["rect"].tl) and box.contains(s["rect"].br)]) or biggest_text(spans)
-        return (t, box, "gros texte (à vérifier)" + ocr) if t else ("", box, "cartouche" + ocr)
+        t = prominent_text([s for s in sp if box.contains(s["rect"].tl) and box.contains(s["rect"].br)]) or prominent_text(sp)
+        return (t, box, "texte en évidence (à vérifier)" + ocr) if t else ("", box, "cartouche" + ocr)
     sizes, cell_of = _cells(box, Hl, Vl, sp)
     for s in ok_all + labels:
         s["cell"] = cell_of(s)
@@ -701,6 +753,9 @@ def cartouche_title(pg, hint=""):
         first = next((i for i, x in enumerate(parts) if _overlap(hint_t, x) > 0), 0)
         if first and _overlap(hint_t, " ".join(parts[first:])) >= _overlap(hint_t, best_t):
             best_t = " | ".join(parts[first:])          # lignes au-dessus sans rapport (nom du projet, client...)
+    if not best_t.strip():
+        t = prominent_text(sp)
+        return (t, box, "texte en évidence (à vérifier)" + ocr) if t else ("", box, "cartouche" + ocr)
     return best_t, box, best_o + ocr
 
 GUI = len(sys.argv) < 2
