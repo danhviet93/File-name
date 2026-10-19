@@ -169,7 +169,7 @@ def _page_data(pg, textpage=None):
                 try:
                     pts = [q.ul, q.ur, q.lr, q.ll]
                 except AttributeError:
-                    pts = list(q)
+                    pts = [q[0], q[1], q[3], q[2]]     # tuple (ul, ur, ll, lr) -> parcours du contour
                 for i in range(4):
                     add(pts[i][0], pts[i][1], pts[(i + 1) % 4][0], pts[(i + 1) % 4][1])
     raw = []
@@ -362,6 +362,9 @@ def find_cartouche(pg, segs=None, spans=None, rects=None):
 def _cells(box, Hl, Vl, sp):
     bx0, by0, bx1, by1 = box
     w, h = bx1 - bx0, by1 - by0
+    # traits découpés en morceaux (pointillés, export Ghostscript/PDF24): on recolle les morceaux espacés de < 8 pt
+    Hl = _merge([tuple(x) for x in Hl], 0, tol=1.0, gap=8)
+    Vl = _merge([tuple(x) for x in Vl], 0, tol=1.0, gap=8)
     step = max(w, h) / 450.0
     nx, ny = int(w / step) + 2, int(h / step) + 2
     blocked = [[False] * nx for _ in range(ny)]
@@ -433,7 +436,7 @@ BOILERPLATE = re.compile(
     r"confidentiel|direction engineering|architecture, design and technical|groupe adp|^page \d|^\d+ ?/ ?\d+$|copyright|©")
 
 # Étiquette qui annonce le titre dans le cartouche ("Titre :", "Désignation", "Intitulé du plan"...)
-TITLE_LABEL = re.compile(r"^(?:titre|intitule|designation|libelle|nom(?= d))(?: du| de la| de l'| de)?"
+TITLE_LABEL = re.compile(r"^(?:titres?|intitule|designation|libelle|nom(?= d))(?: du| de la| de l'| de)?"
                          r"(?: plan| document| dessin| dossier)?\b\s*[:\-.]?\s*(.*)$")
 STOP = set("de du des le la les l d et en au aux a pour sur sous par un une avec".split())
 
@@ -473,7 +476,7 @@ def prominent_text(spans, ratio=0.7, n=10):
         legal = BOILERPLATE.search(_norm(t)) and (sp["size"] < 1.5 * body or len(t) > 60)   # "Groupe ADP" en gros titre: gardé
         if len(re.findall(r"[A-Za-zÀ-ÿ]", t)) < 2 or legal or _is_label(t) or sp["lum"] > 0.85:
             continue
-        if " " not in t and re.search(r"\d", t):
+        if (" " not in t and re.search(r"\d", t)) or _is_code(t):
             continue
         c.append(sp)
     if not c:
@@ -641,13 +644,20 @@ def _assemble(ok, chain=True):
             out.append(s["text"])
     return " | ".join(out)[:400]
 
+def _is_code(t):
+    """Ligne de codification ('CDGCIPFR23_00 1190 DCE G CAL GEN XTN001'): presque que des codes courts ou chiffrés."""
+    w = t.split()
+    if len(w) < 4:
+        return False
+    return sum(1 for x in w if re.search(r"[\d_]", x) or (len(x) <= 3 and x.isupper()) or not re.search(r"[A-Za-z]", x)) >= 0.7 * len(w)
+
 def _readable(t):
     """Texte qui peut faire partie d'un titre (pas un code, une date, un indice...)."""
     if len(re.findall(r"[A-Za-zÀ-ÿ]", t)) < 4:
         return False
     if " " not in t and re.search(r"\d", t):
         return False
-    return not BOILERPLATE.search(_norm(t))
+    return not _is_code(t) and not BOILERPLATE.search(_norm(t))
 
 def _strip_label(t):
     """'Titre : PLAN DU RDC' -> 'PLAN DU RDC'. Retourne (texte, True si une étiquette de titre a été trouvée)."""
