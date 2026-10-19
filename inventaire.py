@@ -141,7 +141,13 @@ def _page_data(pg, textpage=None):
             seen.add(key)
             segs.append((X0, Y0, X1, Y1))
 
+    dark = []                                   # aplats foncés (texte blanc sur fond bleu...)
     for p in pg.get_cdrawings():
+        f = p.get("fill")
+        if f and len(f) >= 3 and f[0] * 0.3 + f[1] * 0.59 + f[2] * 0.11 < 0.5:
+            fr = pymupdf.Rect(p["rect"]) * M; fr.normalize()
+            if fr.width >= 20 and fr.height >= 8:
+                dark.append(fr)
         for it in p["items"]:
             n_items += 1
             t = it[0]
@@ -193,6 +199,10 @@ def _page_data(pg, textpage=None):
         r = pymupdf.Rect(s["bbox"]) * M; r.normalize()
         c = s["color"]
         lum = (((c >> 16) & 255) * 0.3 + ((c >> 8) & 255) * 0.59 + (c & 255) * 0.11) / 255
+        if lum > 0.6:                           # texte clair sur aplat foncé: il est bien lisible
+            cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+            if any(fr.x0 <= cx <= fr.x1 and fr.y0 <= cy <= fr.y1 for fr in dark):
+                lum = 1 - lum
         bold = bool(s["flags"] & 16) or "bold" in s["font"].lower() or "black" in s["font"].lower()
         raw_t = s["text"]
         items.append({"size": s["size"], "text": t, "rect": r, "lum": lum, "dir": d, "bold": bold,
@@ -442,8 +452,8 @@ def _norm(text):
     return "".join(c for c in t if not unicodedata.combining(c))
 
 def _body_size(spans):
-    """Taille du corps de texte = médiane pondérée par le nombre de caractères."""
-    sz = sorted((sp["size"], len(sp["text"])) for sp in spans)
+    """Taille du corps de texte = médiane des tailles des lignes (un long titre ne fausse pas le calcul)."""
+    sz = sorted((sp["size"], 1) for sp in spans)
     if not sz:
         return 0
     half, acc = sum(n for _, n in sz) / 2, 0
@@ -457,9 +467,11 @@ def prominent_text(spans, ratio=0.7, n=10):
     """Toutes les lignes en évidence de la page (plus grosse police, en gras un peu plus petit), dans l'ordre de lecture.
     Sert de repli quand aucun titre n'est trouvé autrement."""
     c = []
+    body = _body_size(spans)
     for sp in spans:
         t = sp["text"]
-        if len(re.findall(r"[A-Za-zÀ-ÿ]", t)) < 2 or BOILERPLATE.search(_norm(t)) or _is_label(t) or sp["lum"] > 0.85:
+        legal = BOILERPLATE.search(_norm(t)) and (sp["size"] < 1.5 * body or len(t) > 60)   # "Groupe ADP" en gros titre: gardé
+        if len(re.findall(r"[A-Za-zÀ-ÿ]", t)) < 2 or legal or _is_label(t) or sp["lum"] > 0.85:
             continue
         if " " not in t and re.search(r"\d", t):
             continue
@@ -758,6 +770,19 @@ def cartouche_title(pg, hint=""):
         return (t, box, "texte en évidence (à vérifier)" + ocr) if t else ("", box, "cartouche" + ocr)
     return best_t, box, best_o + ocr
 
+def debug(path, page=0):
+    """python inventaire.py --debug fichier.pdf [n° page]: affiche ce que le script voit sur la page."""
+    d = pymupdf.open(path)
+    pg = d[page]
+    segs, spans, n_items, rects = _page_data(pg)
+    print(f"Page {page + 1}/{len(d)}  taille {pg.rect.width:.0f}x{pg.rect.height:.0f}  rotation {pg.rotation}  "
+          f"tracés {n_items}  lignes de texte {len(spans)}  corps {_body_size(spans):.1f}")
+    for s in sorted(spans, key=lambda s: -s["size"])[:40]:
+        print(f"  {s['size']:6.1f}  lum {s['lum']:.2f}  {'G' if s['bold'] else ' '}  dir {s['dir']}  "
+              f"({s['rect'].x0:.0f},{s['rect'].y0:.0f})  {s['text'][:80]}")
+    t, box, o = cartouche_title(pg, parse_name(pathlib.Path(path).stem)[1 + len(CODE_FIELDS)])
+    print(f"\nCadre: {box}\nOrigine: {o}\nTitre: {t}")
+
 GUI = len(sys.argv) < 2
 STAMP = datetime.datetime.now().strftime("%Y-%m-%d_%Hh%M")
 
@@ -923,6 +948,10 @@ def run_job(root, out, state, cancel):
         state["done"] = True
 
 # ------------------------------------------------------------------ Lancement ----------
+if len(sys.argv) > 2 and sys.argv[1] == "--debug":
+    debug(sys.argv[2], int(sys.argv[3]) - 1 if len(sys.argv) > 3 else 0)
+    raise SystemExit
+
 if GUI:
     import threading, time
     import tkinter as tk
