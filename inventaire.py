@@ -476,14 +476,18 @@ def prominent_text(spans, ratio=0.7, n=10):
         if " " not in t and re.search(r"\d", t):
             continue
         c.append(sp)
-    hz = [sp for sp in c if sp["dir"][0] > 0.7]
-    c = hz or c
     if not c:
         return ""
+    # sens de lecture du plus gros texte (page tournée: texte vertical), on garde les textes dans ce sens
+    dx, dy = max(c, key=lambda sp: sp["size"])["dir"]
+    c = [sp for sp in c if abs(sp["dir"][0] - dx) < 0.3 and abs(sp["dir"][1] - dy) < 0.3]
     mx = max(sp["size"] for sp in c)
     top = [sp for sp in c if sp["size"] >= ratio * mx or (sp["bold"] and sp["size"] >= (ratio - 0.1) * mx)]
     top = sorted(top, key=lambda sp: -sp["size"])[:n]
-    top.sort(key=lambda sp: (round(sp["rect"].y0 / (mx * 0.5)), sp["rect"].x0))
+    def reading(sp):                                  # ordre de lecture dans le repère du texte
+        cx, cy = (sp["rect"].x0 + sp["rect"].x1) / 2, (sp["rect"].y0 + sp["rect"].y1) / 2
+        return (round((-dy * cx + dx * cy) / (mx * 0.5)), cx * dx + cy * dy)
+    top.sort(key=reading)
     out = []
     for sp in top:
         if sp["text"] not in out:
@@ -707,17 +711,18 @@ def cartouche_title(pg, hint=""):
             return "(aucun texte - page scannée ou texte vectorisé ?)", None, "aucun texte"
         return "(cartouche non détecté)", None, "non détecté"
     k, box, (W, H, Hl, Vl, sp) = found
-    if doc:
-        # Document (page de garde Word...): le "cartouche" trouvé est souvent le tableau des révisions / signatures
-        # en bas de page. Si un texte beaucoup plus gros existe hors de ce tableau, c'est lui le titre.
-        inside = [s for s in sp if box.contains(s["rect"].tl) and box.contains(s["rect"].br)]
-        outside = [s for s in sp if not (box.contains(s["rect"].tl) and box.contains(s["rect"].br))]
-        mx_in = max((s["size"] for s in inside), default=0)
-        t = prominent_text(outside)
-        if t:
-            mx_out = max(s["size"] for s in outside if s["text"] in t.split(" | "))
-            if mx_out >= 1.5 * mx_in and (box.width >= 0.8 * W or mx_out >= 2.5 * mx_in):
-                return t, None, "texte en évidence"
+    # Le cadre trouvé n'est pas toujours un cartouche: tableau des révisions en bas d'une page de garde,
+    # bloc de lignes d'un planning (Gantt)... Si un texte bien plus gros existe hors du cadre, c'est lui le titre.
+    inside = [s for s in sp if box.contains(s["rect"].tl) and box.contains(s["rect"].br)]
+    outside = [s for s in sp if not (box.contains(s["rect"].tl) and box.contains(s["rect"].br))]
+    mx_in = max((s["size"] for s in inside), default=0)
+    n_lab = sum(1 for s in inside if _is_label(s["text"]) and len(re.findall(r"[A-Za-z]", s["text"])) >= 3)
+    t = prominent_text(outside)
+    if t:
+        mx_out = max(s["size"] for s in outside if s["text"] in t.split(" | "))
+        weak = n_lab < 2                                  # aucun mot d'étiquette (Indice, Date, Phase...): pas un cartouche
+        if mx_out >= 1.5 * mx_in and (weak or (doc and (box.width >= 0.8 * W or mx_out >= 2.5 * mx_in))):
+            return t, None, "texte en évidence"
     ok_all, labels = [], []
     for s in sp:
         r = s["rect"]
