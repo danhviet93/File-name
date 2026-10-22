@@ -925,11 +925,16 @@ def build_sheets(wb, ws, n):
     rs.column_dimensions[L(C_LIEN)].hidden = True
     rs.freeze_panes = "A4"
 
+def default_out(root):
+    """Fichier Excel enregistré dans le dossier analysé, nommé comme ce dossier (ex: D:\\Projet\\DCE -> DCE.xlsx)."""
+    return root / f"{root.name or 'Inventaire'}.xlsx"
+
 def save_workbook(wb, out, root):
     """Sauvegarde avec solutions de repli si le dossier n'existe pas, est protégé ou le fichier est verrouillé."""
     home = pathlib.Path.home()
-    for target in [out, home / "OneDrive" / "Desktop" / out.name, home / "Documents" / out.name,
-                   home / out.name, root / out.name]:
+    stamped = out.with_name(f"{out.stem}_{STAMP}{out.suffix}")    # fichier déjà ouvert dans Excel -> nom daté
+    for target in [out, stamped, home / "OneDrive" / "Desktop" / out.name, home / "Desktop" / out.name,
+                   home / "Documents" / out.name, home / out.name]:
         try:
             wb.save(target)
             return target
@@ -978,7 +983,7 @@ if GUI:
     if not folder:
         raise SystemExit
     ROOT = pathlib.Path(folder)
-    OUT = pathlib.Path.home() / "Desktop" / f"Inventaire_{STAMP}.xlsx"
+    OUT = default_out(ROOT)
 
     state = {"i": 0, "total": 0, "name": "", "phase": "scan", "done": False, "result": None, "error": None}
     cancel = threading.Event()
@@ -1052,7 +1057,7 @@ if GUI:
     win.mainloop()
 else:
     ROOT = pathlib.Path(sys.argv[1])
-    OUT = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else pathlib.Path.home() / "Desktop" / f"Inventaire_{STAMP}.xlsx"
+    OUT = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else default_out(ROOT)
     import threading
     state = {"i": 0, "total": 0, "name": "", "phase": "scan", "done": False, "result": None, "error": None}
     run_job(ROOT, OUT, state, threading.Event())
