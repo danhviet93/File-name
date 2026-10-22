@@ -511,7 +511,7 @@ def _cells(box, Hl, Vl, sp):
 ANCHOR_RATIO = 0.76
 CHAIN_RATIO = 0.38      # 1re ligne sous le titre (sous-titre): >= 38% de la taille du titre
 CHAIN_RATIO_NEXT = 0.7   # lignes suivantes: proches de la taille de la ligne au-dessus (évite les étiquettes)
-MAX_CHAIN = 4        # nombre max de lignes ajoutées sous le titre
+MAX_CHAIN = 8        # nombre max de lignes ajoutées autour du titre
 CHAIN_GAP = 3.5       # écart vertical max (en hauteurs de ligne) entre deux lignes du titre
 BIG_CELL = 0.3     # on ne garde que les cellules >= 30% de la plus grande cellule contenant du texte
 
@@ -573,7 +573,7 @@ def _join(spans):
     for sp in spans:
         if sp["text"] not in out:
             out.append(sp["text"])
-    return " | ".join(out)[:400]
+    return " | ".join(out)[:600]
 
 def prominent_spans(spans, ratio=0.7, n=10):
     c = []
@@ -714,22 +714,23 @@ def central_text(pg):
     return " | ".join(out)[:800]
 
 def _assemble(ok, chain=True):
-    """Titre = lignes en plus grande police (ancres) + lignes plus petites qui les prolongent vers le bas."""
+    """Titre = lignes en plus grande police (ancres) + lignes voisines (au-dessus et en dessous) qui forment le même
+    bloc: écart vertical <= CHAIN_GAP hauteurs de ligne (1 à 2 lignes vides tolérées), alignées horizontalement."""
     if not ok:
         return ""
     mx = max(s["size"] for s in ok)
     for s_ in ok:
         s_["anchor"] = s_["size"] >= mx * ANCHOR_RATIO
     keep = [s_ for s_ in ok if s_["anchor"]]
-    # On ajoute, vers le bas, les lignes plus petites qui prolongent le titre (sous-titre, zone...).
-    # Chaque ligne est comparée à la ligne au-dessus d'elle (pas à la plus grande police du cartouche).
+    # On ajoute les lignes qui prolongent le titre (projet au-dessus, sous-titre, zone en dessous...).
+    # Chaque ligne est comparée à sa voisine déjà retenue (pas à la plus grande police du cartouche).
     for _ in range(MAX_CHAIN if chain else 0):
         best = None
         for c in ok:
             if c in keep:
                 continue
             for kk in keep:
-                gap = c["rect"].y0 - kk["rect"].y1
+                gap = max(c["rect"].y0 - kk["rect"].y1, kk["rect"].y0 - c["rect"].y1)   # dessous ou dessus
                 overlap = min(c["rect"].x1, kk["rect"].x1 + 0.1 * kk["rect"].width) - \
                           max(c["rect"].x0, kk["rect"].x0 - 0.1 * kk["rect"].width)
                 if (-0.3 * kk["size"] <= gap <= CHAIN_GAP * kk["size"] and overlap > 0
@@ -741,11 +742,7 @@ def _assemble(ok, chain=True):
         best[1]["anchor"] = False
         keep.append(best[1])
     keep.sort(key=lambda s: (round(s["rect"].y0 / (mx * 0.4)), s["rect"].x0))
-    out = []
-    for s in keep:
-        if s["text"] not in out:
-            out.append(s["text"])
-    return " | ".join(out)[:400]
+    return _join(keep)
 
 def _is_code(t):
     """Ligne de codification ('CDGCIPFR23_00 1190 DCE G CAL GEN XTN001'): presque que des codes courts ou chiffrés."""
@@ -864,13 +861,16 @@ def cartouche_title(pg, hint=""):
     inside = [s for s in sp if box.contains(s["rect"].tl) and box.contains(s["rect"].br)]
     outside = [s for s in sp if not (box.contains(s["rect"].tl) and box.contains(s["rect"].br))]
     mx_in = max((s["size"] for s in inside), default=0)
+    cover = ""
     n_lab = sum(1 for s in inside if _is_label(s["text"]) and len(re.findall(r"[A-Za-z]", s["text"])) >= 3)
     t = prominent_text(outside)
     if t:
         mx_out = max(s["size"] for s in outside if s["text"] in t.split(" | "))
         weak = n_lab < 2                                  # aucun mot d'étiquette (Indice, Date, Phase...): pas un cartouche
-        if mx_out >= 1.5 * mx_in and (weak or (doc and (box.width >= 0.8 * W or mx_out >= 2.5 * mx_in))):
-            return t, None, "texte en évidence"
+        if mx_out >= 1.5 * mx_in and (weak or (doc and box.width >= 0.8 * W)):
+            return t, None, "texte en évidence"           # planning, tableau des révisions en bas de page de garde
+        if mx_out >= 1.5 * mx_in and doc and mx_out >= 2.5 * mx_in:
+            cover = t                                     # gros titre de page de garde + vrai cartouche: on garde les deux
     if doc and n_lab < 2:
         found = None                                      # document (mail, note): signature / mentions en bas de page
     if found is None:
@@ -934,6 +934,10 @@ def cartouche_title(pg, hint=""):
     if not best_t.strip():
         t = prominent_text(sp)
         return (t, box, "texte en évidence (à vérifier)" + ocr) if t else ("", box, "cartouche" + ocr)
+    if cover:
+        parts = cover.split(" | ")
+        parts += [x for x in best_t.split(" | ") if x not in parts]
+        best_t, best_o = " | ".join(parts)[:600], "texte en évidence + cartouche"
     return best_t, box, best_o + ocr
 
 def debug(path, page=0):
@@ -1002,9 +1006,10 @@ WIDTHS = {"Nom": 45, "Sous-dossier": 30, "Description (nom fichier)": 40,
           "Titre PDF": 25, "Titre détecté": 60, "Origine titre": 14, "Chemin": 40, "Lien": 9, "Index": 8,
           "Ouvrir": 9, "Lien relatif": 30, "Trouvé": 9}
 # Ordre des colonnes de la feuille Recherche: ce qui sert à retrouver le fichier d'abord
-SEARCH_COLS = (["Titre détecté", "Nom", "Chemin", "Sous-dossier", "Projet"] + CODE_FIELDS +
+# "Ouvrir" = lien calculé, les autres = colonnes de l'Inventaire
+SEARCH_COLS = (["Titre détecté", "Chemin", "Ouvrir", "Nom", "Sous-dossier", "Projet"] + CODE_FIELDS +
                ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)", "Modifié le", "Titre PDF",
-                "Origine titre", "Lien relatif"])
+                "Origine titre"])
 
 def list_pdfs(root):
     out = []
@@ -1122,7 +1127,7 @@ def build_sheets(wb, ws, n):
 
     # ---- Feuille de recherche par mots-clés ----
     # Ligne i = i-ème fichier trouvé (compteur cumulé de l'Inventaire, recherche dichotomique: rapide).
-    # Colonne A = lien "Ouvrir", puis Titre détecté, Nom, Chemin... (ordre SEARCH_COLS), colonne cachée = n° de ligne.
+    # Colonnes: Titre détecté, Chemin, Ouvrir, Nom... (ordre SEARCH_COLS), colonne cachée = n° de ligne.
     rs = wb.create_sheet("Recherche", 0)
     rs["A1"] = "Mots-clés :"
     rs["A1"].font = Font(bold=True, size=14, color="1F4E79")
@@ -1140,11 +1145,11 @@ def build_sheets(wb, ws, n):
     rs["B2"] = f'={total}&" fichier(s) trouvé(s) sur {n}"'
     rs["B2"].font = Font(bold=True, color="2F75B5")
     head = PatternFill("solid", fgColor="1F4E79")
-    for i, h in enumerate(["Ouvrir"] + SEARCH_COLS, start=1):
+    for i, h in enumerate(SEARCH_COLS, start=1):
         c = rs.cell(row=3, column=i, value=h)
         c.font = Font(bold=True, color="FFFFFF")
         c.fill = head
-    c_row = len(SEARCH_COLS) + 2                      # colonne cachée: n° de ligne dans l'Inventaire
+    c_row = len(SEARCH_COLS) + 1                      # colonne cachée: n° de ligne dans l'Inventaire
     rs.cell(row=3, column=c_row, value="Ligne")
     cnt = f"Inventaire!${L(C_CNT)}$2:${L(C_CNT)}${n + 1}"
     rel_col = f"Inventaire!${L(C_REL)}$2:${L(C_REL)}${n + 1}"
@@ -1153,20 +1158,21 @@ def build_sheets(wb, ws, n):
         r = 3 + i
         h = f"${L(c_row)}{r}"
         rs.cell(row=r, column=c_row, value=f'=IF({i}>{total},"",IFERROR(MATCH({i}-0.5,{cnt},1),0)+1)')
-        c = rs.cell(row=r, column=1, value=f'=IF({h}="","",HYPERLINK(INDEX({rel_col},{h}),"Ouvrir"))')
-        c.font = link
-        for j, name in enumerate(SEARCH_COLS, start=2):
+        for j, name in enumerate(SEARCH_COLS, start=1):
+            if name == "Ouvrir":
+                c = rs.cell(row=r, column=j, value=f'=IF({h}="","",HYPERLINK(INDEX({rel_col},{h}),"Ouvrir"))')
+                c.font = link
+                continue
             k = HEADERS.index(name) + 1
             src = f"Inventaire!${L(k)}$2:${L(k)}${n + 1}"
             rs.cell(row=r, column=j, value=f'=IF({h}="","",IF(INDEX({src},{h})="","",INDEX({src},{h})))')
-    rs.column_dimensions["A"].width = WIDTHS["Ouvrir"] + 4
-    for i, h in enumerate(SEARCH_COLS, start=2):
+    for i, h in enumerate(SEARCH_COLS, start=1):
         rs.column_dimensions[L(i)].width = WIDTHS.get(h, 12)
-    rs.column_dimensions["B"].width = max(WIDTHS["Titre détecté"], 60)
-    rs.column_dimensions[L(len(SEARCH_COLS) + 1)].hidden = True   # Lien relatif
+    rs.column_dimensions["A"].width = max(WIDTHS["Titre détecté"], 60)
+    rs.column_dimensions["B"].width = 60                                  # chemin complet, à copier
     rs.column_dimensions[L(c_row)].hidden = True
-    rs.conditional_formatting.add(f"B4:B{n + 3}",
-                                  FormulaRule(formula=[highlight_formula("B4")], fill=blue, font=Font(bold=True)))
+    rs.conditional_formatting.add(f"A4:A{n + 3}",
+                                  FormulaRule(formula=[highlight_formula("A4")], fill=blue, font=Font(bold=True)))
     rs.freeze_panes = "B4"
 
 def link_target(rel):
