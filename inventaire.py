@@ -8,9 +8,13 @@ from openpyxl.worksheet.formula import ArrayFormula
 from openpyxl.styles import Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
+# Caractères interdits dans le XML d'Excel: contrôles, mais aussi U+FFFE/U+FFFF et "surrogates" isolés
+# (texte PDF mal encodé, métadonnées). Sans lxml, openpyxl les écrit quand même -> fichier corrompu.
+XML_BAD = re.compile("[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]")
+
 def clean(x):
-    # retire les caractères de contrôle interdits dans Excel
-    return ILLEGAL_CHARACTERS_RE.sub("", x) if isinstance(x, str) else x
+    # retire les caractères interdits dans Excel (sinon Excel "répare" le fichier et supprime la feuille)
+    return XML_BAD.sub("", ILLEGAL_CHARACTERS_RE.sub("", x)) if isinstance(x, str) else x
 
 pymupdf.TOOLS.mupdf_display_errors(False)
 
@@ -884,7 +888,7 @@ def scan(root, pdfs, state, cancel):
                 f"{p.stem.replace('_', ' ')} {title} {txt}"])
         ws.append([clean(v) for v in row])
         c = ws.cell(row=ws.max_row, column=C_LIEN)
-        c.hyperlink = str(p)
+        c.hyperlink = clean(str(p))
         c.font = Font(color="0563C1", underline="single")
         n += 1
         state["i"] = n
@@ -912,7 +916,7 @@ def build_sheets(wb, ws, n):
     last = n + 1
     mots = '_xlfn.TEXTSPLIT(TRIM($B$1)," ")'
     formula = (
-        f'=IFERROR(_xlfn._xlws.FILTER(Inventaire!$A$2:${L(C_CHEMIN)}${last},'
+        f'=IFERROR(_xlfn._xlws.FILTER(IF(Inventaire!$A$2:${L(C_CHEMIN)}${last}="","",Inventaire!$A$2:${L(C_CHEMIN)}${last}),'
         f'MMULT(--ISNUMBER(SEARCH({mots},Inventaire!${L(C_INDEX)}$2:${L(C_INDEX)}${last})),'
         f'TRANSPOSE(--({mots}<>"")))=COLUMNS({mots}),""),"")'
     )
