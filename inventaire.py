@@ -51,6 +51,8 @@ def _tessdata():
                          os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
                 cands.append(os.path.join(base, "Tesseract-OCR", "tessdata"))
             found = next((c for c in cands if c and os.path.isfile(os.path.join(c, "eng.traineddata"))), None)
+        if found and not any(os.path.isfile(os.path.join(found, x + ".traineddata")) for x in ("fra", "eng")):
+            found = None                                  # Tesseract incomplet (aucune langue installée)
         _TESSDATA.append(found)
     return _TESSDATA[0]
 
@@ -330,18 +332,19 @@ def _score_box(r, sp, W, H, min_txt, min_area, max_area=0.55):
     area = r.get_area() / (W * H)
     if not (min_area <= area <= max_area):
         return None
-    inside = [s for s in sp if r.contains(s["rect"].tl) and r.contains(s["rect"].br)]
+    # comparaisons simples (Rect.contains est très lent appelé des millions de fois: plannings, grilles)
+    X0, Y0, X1, Y1 = r.x0, r.y0, r.x1, r.y1
+    inside = [s for s in sp if X0 <= s["_r"][0] and Y0 <= s["_r"][1] and s["_r"][2] <= X1 and s["_r"][3] <= Y1]
     if len(inside) < min_txt:
         return None
     ltr = sum(1 for s in inside if s["dir"][0] > 0.7) / len(inside)       # texte lu de gauche à droite
     if ltr < 0.55:
         return None
-    labels = sum(1 for s in inside if _is_label(s["text"]) and len(re.findall(r"[A-Za-z]", s["text"])) >= 3)
+    labels = sum(1 for s in inside if s["_lab"])
     # un cartouche contient aussi un titre: texte lisible (pas une étiquette) plus grand que le reste du cadre
     sz = sorted(s["size"] for s in inside)
     med = sz[len(sz) // 2]
-    big = any(s["size"] >= 1.2 * med and s["dir"][0] > 0.7 and not _is_label(s["text"]) and _readable(s["text"])
-              for s in inside)
+    big = any(s["size"] >= 1.2 * med and s["dir"][0] > 0.7 and s["_title_ok"] for s in inside)
     return 3 * min(labels, 12) + 0.15 * min(len(inside), 60) + 5 * ltr - 0.12 * area * 100 + (4 if big else 0)
 
 def find_cartouche(pg, segs=None, spans=None, rects=None):
@@ -367,7 +370,16 @@ def find_cartouche(pg, segs=None, spans=None, rects=None):
             r = pymupdf.Rect(min(p1[0], p2[0]), min(p1[1], p2[1]), max(p1[0], p2[0]), max(p1[1], p2[1]))
             if r.x1 >= 0.92 * W and r.y1 >= 0.92 * H:
                 boxes.append((r, 4, 0.003))
+        for s in sp:                                                    # calculés une fois par repère
+            s["_r"] = (s["rect"].x0, s["rect"].y0, s["rect"].x1, s["rect"].y1)
+            s["_lab"] = _is_label(s["text"]) and len(re.findall(r"[A-Za-z]", s["text"])) >= 3
+            s["_title_ok"] = not _is_label(s["text"]) and _readable(s["text"])
+        seen_boxes = set()
         for r, min_txt, min_area in boxes:
+            kb = (round(r.x0), round(r.y0), round(r.x1), round(r.y1), min_txt, min_area)
+            if kb in seen_boxes:                                        # même cadre trouvé plusieurs fois
+                continue
+            seen_boxes.add(kb)
             sc = _score_box(r, sp, W, H, min_txt, min_area, 0.55 if min_area >= 0.004 and min_txt >= 5 else 0.25)
             if sc is None:
                 continue
@@ -744,6 +756,9 @@ def _by_label(ok_all, labels, cell_of):
 
 def cartouche_title(pg, hint=""):
     """Retourne (titre, cadre du cartouche, origine). hint = description tirée du nom de fichier (aide au choix)."""
+    if not _tessdata() and (not pg.get_fonts(full=True) or not pg.get_text("text", flags=TXT_FLAGS).strip()):
+        # aucun texte et pas d'OCR possible: inutile d'analyser les traits (très long sur un plan vectorisé)
+        return "(aucun texte - page scannée ou texte vectorisé ?)", None, "aucun texte"
     segs, spans, n_items, rects = _page_data(pg)
     ocr = ""
     if not spans:                                         # aucun texte: scan ou texte vectorisé -> OCR si possible
@@ -848,7 +863,12 @@ def debug(path, page=0):
     for s in sorted(spans, key=lambda s: -s["size"])[:40]:
         print(f"  {s['size']:6.1f}  lum {s['lum']:.2f}  {'G' if s['bold'] else ' '}  dir {s['dir']}  "
               f"({s['rect'].x0:.0f},{s['rect'].y0:.0f})  {s['text'][:80]}")
-    t, box, o = cartouche_title(pg, parse_name(pathlib.Path(path).stem)[1 + len(CODE_FIELDS)])
+    desc = parse_name(pathlib.Path(path).stem)[1 + len(CODE_FIELDS)]
+    t, box, o = cartouche_title(pg, desc)
+    if o.startswith("aucun texte"):
+        print(f"\nAucun texte sur la page ({len(pg.get_fonts())} police, {len(pg.get_images())} image): "
+              + ("scan (image)" if pg.get_images() else "texte transformé en traits (vectorisé)"))
+        t, o = fallback_title(d.metadata.get("title", ""), pathlib.Path(path).stem, desc, page_kind(pg))
     print(f"\nCadre: {box}\nOrigine: {o}\nTitre: {t}")
 
 GUI = len(sys.argv) < 2
@@ -926,16 +946,24 @@ def highlight_formula(cell):
     """Mise en forme conditionnelle: la cellule contient au moins un des mots-clés."""
     return f'AND(TRIM({KW})<>"",SUMPRODUCT(({WORDS}<>"")*ISNUMBER(SEARCH({WORDS},{cell})))>0)'
 
-def fallback_title(meta, stem, desc):
-    """PDF sans texte (scan) et pas d'OCR: titre des propriétés du PDF s'il a un sens, sinon le nom du fichier."""
-    t = re.sub(r"^(microsoft (word|excel|powerpoint)|word|excel)\s*-\s*", "", (meta or "").strip(), flags=re.I)
+def page_kind(pg):
+    """Pourquoi une page n'a pas de texte: image scannée, texte transformé en traits, ou page vide."""
+    if pg.get_images():
+        return "scan"
+    return "texte vectorisé" if len(pg.read_contents()) > 20000 else "page vide"
+
+def fallback_title(meta, stem, desc, kind="scan"):
+    """PDF sans texte (scan, ou texte transformé en traits) et pas d'OCR: titre des propriétés du PDF
+    s'il a un sens, sinon le nom du fichier. kind = "scan" ou "texte vectorisé" (indiqué dans l'origine)."""
+    t = (meta or "").strip().strip("()[]\"'« »").strip()
+    t = re.sub(r"^(microsoft (word|excel|powerpoint)|word|excel)\s*-\s*", "", t, flags=re.I)
     t = re.sub(r"\.(docx?|xlsx?|pptx?|pdf|dwg)$", "", t, flags=re.I).strip()
     same = _norm(t).replace("_", " ").strip() in (_norm(stem).replace("_", " "), "")
     words = [w for w in t.split() if len(re.findall(r"[A-Za-zÀ-ÿ]", w)) >= 3]
     if t and not same and len(words) >= 2 and not _is_code(t):     # vraie phrase, pas "scan_ADP_001"
-        return t, "propriétés PDF (scan)"
+        return t, f"propriétés PDF ({kind})"
     name = desc or stem
-    return " ".join(name.replace("_", " ").split()), "nom du fichier (scan)"
+    return " ".join(name.replace("_", " ").split()), f"nom du fichier ({kind})"
 
 def scan(root, pdfs, state, cancel):
     """Analyse les PDF un par un et remplit le classeur Excel. state est lu par la fenêtre de progression."""
@@ -962,7 +990,9 @@ def scan(root, pdfs, state, cancel):
                 if t2 and o2 not in ("non détecté", "aucun texte"):
                     txt, origine = t2, o2 + " p.2"
             if origine.startswith("aucun texte") or not txt:
-                txt, origine = fallback_title(title, p.stem, parsed[1 + len(CODE_FIELDS)])
+                # pas d'image sur la page = le texte a été transformé en traits (impression PDF24 / Ghostscript)
+                kind = page_kind(d[0])
+                txt, origine = fallback_title(title, p.stem, parsed[1 + len(CODE_FIELDS)], kind)
             d.close()
         except Exception as e:
             txt = f"ERREUR: {e}"
