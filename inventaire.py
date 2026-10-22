@@ -164,6 +164,35 @@ def _merge_run(items, crossed):
         out.append(dict(s))
     return out
 
+_BOLD = {}
+
+def _bold_fonts(pg):
+    """Polices en gras de la page, d'après le fichier de police intégré: les PDF Outlook/Word nomment souvent
+    les polices 'CIDFont+F2' sans indiquer le gras (ici 'Segoe UI Semibold'). Résultat mis en cache par fichier."""
+    doc = pg.parent
+    key = (doc.name, id(doc))
+    cache = _BOLD.setdefault(key, {})
+    if len(_BOLD) > 4:                                    # on ne garde que les derniers fichiers
+        for k in list(_BOLD)[:-4]:
+            del _BOLD[k]
+    out = set()
+    for f in pg.get_fonts(full=True):
+        xref, base = f[0], f[3]
+        if xref not in cache:
+            bold = False
+            try:
+                buf = doc.extract_font(xref)[3]
+                if buf:
+                    ft = pymupdf.Font(fontbuffer=buf)
+                    nm = ft.name.lower()
+                    bold = bool(ft.is_bold) or any(w in nm for w in ("bold", "black", "heavy", "semibold", "demi"))
+            except Exception:
+                pass
+            cache[xref] = bold
+        if cache[xref]:
+            out.add(base.split("+", 1)[1] if re.match(r"^[A-Z]{6}\+", base) else base)
+    return out
+
 def _page_data(pg, textpage=None):
     """Segments horizontaux/verticaux, lignes de texte et nombre de tracés, dans le repère affiché de la page."""
     M = pg.rotation_matrix
@@ -225,6 +254,7 @@ def _page_data(pg, textpage=None):
                     add(pts[i][0], pts[i][1], pts[(i + 1) % 4][0], pts[(i + 1) % 4][1])
     raw = []
     garbled = set()
+    bold_fonts = _bold_fonts(pg) if textpage is None else set()
     td = (pg.get_text("dict", textpage=textpage) if textpage is not None
           else pg.get_text("dict", flags=TXT_FLAGS))
     for b in td["blocks"]:
@@ -254,7 +284,8 @@ def _page_data(pg, textpage=None):
             cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
             if any(fr.x0 <= cx <= fr.x1 and fr.y0 <= cy <= fr.y1 for fr in dark):
                 lum = 1 - lum
-        bold = bool(s["flags"] & 16) or "bold" in s["font"].lower() or "black" in s["font"].lower()
+        bold = (bool(s["flags"] & 16) or "bold" in s["font"].lower() or "black" in s["font"].lower()
+                or s["font"] in bold_fonts)
         raw_t = s["text"]
         items.append({"size": s["size"], "text": t, "rect": r, "lum": lum, "dir": d, "bold": bold,
                       "sp_before": raw_t[:1].isspace(), "sp_after": raw_t[-1:].isspace()})
@@ -530,6 +561,16 @@ def _body_size(spans):
 def prominent_text(spans, ratio=0.7, n=10):
     """Toutes les lignes en évidence de la page (plus grosse police, en gras un peu plus petit), dans l'ordre de lecture.
     Sert de repli quand aucun titre n'est trouvé autrement."""
+    return _join(prominent_spans(spans, ratio, n))
+
+def _join(spans):
+    out = []
+    for sp in spans:
+        if sp["text"] not in out:
+            out.append(sp["text"])
+    return " | ".join(out)[:400]
+
+def prominent_spans(spans, ratio=0.7, n=10):
     c = []
     body = _body_size(spans)
     for sp in spans:
@@ -541,7 +582,7 @@ def prominent_text(spans, ratio=0.7, n=10):
             continue
         c.append(sp)
     if not c:
-        return ""
+        return []
     # sens de lecture du plus gros texte (page tournée: texte vertical), on garde les textes dans ce sens
     dx, dy = max(c, key=lambda sp: sp["size"])["dir"]
     c = [sp for sp in c if abs(sp["dir"][0] - dx) < 0.3 and abs(sp["dir"][1] - dy) < 0.3]
@@ -552,11 +593,7 @@ def prominent_text(spans, ratio=0.7, n=10):
         cx, cy = (sp["rect"].x0 + sp["rect"].x1) / 2, (sp["rect"].y0 + sp["rect"].y1) / 2
         return (round((-dy * cx + dx * cy) / (mx * 0.5)), cx * dx + cy * dy)
     top.sort(key=reading)
-    out = []
-    for sp in top:
-        if sp["text"] not in out:
-            out.append(sp["text"])
-    return " | ".join(out)[:400]
+    return top
 
 COVER_RATIO = 1.8   # document: police du titre >= 1,8 x corps du texte -> page de garde, on prend les textes en évidence
 
@@ -754,6 +791,48 @@ def _by_label(ok_all, labels, cell_of):
                 return t
     return ""
 
+def _heading_spans(spans, H, body, n=2):
+    """Lignes de titre en gras en haut de page (objet d'un mail, titre Word...): courtes, pas un paragraphe."""
+    out = []
+    for s in sorted(spans, key=lambda s: s["rect"].y0):
+        t = s["text"]
+        if not s["bold"] or s["dir"][0] < 0.7 or (s["rect"].y0 + s["rect"].y1) / 2 > 0.4 * H or s["size"] < 0.8 * body:
+            continue
+        words = [w for w in t.split() if len(re.findall(r"[A-Za-zÀ-ÿ]", w)) >= 3]
+        if len(words) < 2 or len(t) > 150 or _is_label(t) or _is_code(t) or BOILERPLATE.search(_norm(t)):
+            continue
+        out.append(s)
+        if len(out) == n:
+            break
+    return out
+
+def _doc_title(pg, spans, ocr="", doc=True):
+    """Page sans cartouche: document (page de garde, note, mail...) ou repli sur les textes en évidence."""
+    if doc and not ocr and spans:
+        # Titre = lignes en gras en haut de page + lignes plus grosses que le corps du texte (les deux:
+        # le titre n'est pas toujours en gras, ni toujours le plus gros)
+        body = _body_size(spans)
+        heads = _heading_spans(spans, pg.rect.height, body)
+        big = [s for s in prominent_spans(spans) if s["size"] >= 1.15 * body]
+        if heads or big:
+            both = sorted({id(s): s for s in heads + big}.values(), key=lambda s: (s["rect"].y0, s["rect"].x0))
+            return _join(both), None, "texte en évidence"
+    if doc and not ocr:                               # document: pas de cartouche
+        body = _body_size(spans)
+        if spans and max(s["size"] for s in spans) >= COVER_RATIO * body:
+            t = prominent_text(spans)                 # page de garde: gros titre au milieu
+            if t:
+                return t, None, "texte en évidence"
+        t = central_text(pg)                          # sinon paragraphe central
+        if t:
+            return t, None, "texte central"
+    t = prominent_text(spans)
+    if t:
+        return t, None, "texte en évidence (à vérifier)" + ocr
+    if not spans:
+        return "(aucun texte - page scannée ou texte vectorisé ?)", None, "aucun texte"
+    return "(cartouche non détecté)", None, "non détecté"
+
 def cartouche_title(pg, hint=""):
     """Retourne (titre, cadre du cartouche, origine). hint = description tirée du nom de fichier (aide au choix)."""
     if not _tessdata() and (not pg.get_fonts(full=True) or not pg.get_text("text", flags=TXT_FLAGS).strip()):
@@ -773,21 +852,7 @@ def cartouche_title(pg, hint=""):
         if t:
             return t, None, "texte OCR (à vérifier)"
     if found is None:
-        if doc and not ocr:                               # document: pas de cartouche
-            body = _body_size(spans)
-            if spans and max(s["size"] for s in spans) >= COVER_RATIO * body:
-                t = prominent_text(spans)                 # page de garde: gros titre au milieu
-                if t:
-                    return t, None, "texte en évidence"
-            t = central_text(pg)                          # sinon paragraphe central
-            if t:
-                return t, None, "texte central"
-        t = prominent_text(spans)
-        if t:
-            return t, None, "texte en évidence (à vérifier)" + ocr
-        if not spans:
-            return "(aucun texte - page scannée ou texte vectorisé ?)", None, "aucun texte"
-        return "(cartouche non détecté)", None, "non détecté"
+        return _doc_title(pg, spans, ocr, doc)
     k, box, (W, H, Hl, Vl, sp) = found
     # Le cadre trouvé n'est pas toujours un cartouche: tableau des révisions en bas d'une page de garde,
     # bloc de lignes d'un planning (Gantt)... Si un texte bien plus gros existe hors du cadre, c'est lui le titre.
@@ -801,6 +866,10 @@ def cartouche_title(pg, hint=""):
         weak = n_lab < 2                                  # aucun mot d'étiquette (Indice, Date, Phase...): pas un cartouche
         if mx_out >= 1.5 * mx_in and (weak or (doc and (box.width >= 0.8 * W or mx_out >= 2.5 * mx_in))):
             return t, None, "texte en évidence"
+    if doc and n_lab < 2:
+        found = None                                      # document (mail, note): signature / mentions en bas de page
+    if found is None:
+        return _doc_title(pg, spans, ocr, doc)
     ok_all, labels = [], []
     for s in sp:
         r = s["rect"]
