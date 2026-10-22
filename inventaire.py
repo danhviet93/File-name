@@ -794,14 +794,20 @@ def _by_label(ok_all, labels, cell_of):
     return ""
 
 def _heading_spans(spans, H, body, n=2):
-    """Lignes de titre en gras en haut de page (objet d'un mail, titre Word...): courtes, pas un paragraphe."""
+    """Lignes de titre en gras en haut de page (objet d'un mail, titre Word...): courtes, pas un paragraphe,
+    seules sur leur ligne (pas un en-tête de colonne de tableau: 'Prix total | Quantité | P.U.')."""
+    def in_row(s):
+        r = s["rect"]
+        return any(o is not s and min(r.y1, o["rect"].y1) - max(r.y0, o["rect"].y0) > 0.5 * min(r.height, o["rect"].height)
+                   and (o["rect"].x0 > r.x1 + 2 or o["rect"].x1 < r.x0 - 2) for o in spans)
     out = []
     for s in sorted(spans, key=lambda s: s["rect"].y0):
         t = s["text"]
         if not s["bold"] or s["dir"][0] < 0.7 or (s["rect"].y0 + s["rect"].y1) / 2 > 0.4 * H or s["size"] < 0.8 * body:
             continue
-        words = [w for w in t.split() if len(re.findall(r"[A-Za-zÀ-ÿ]", w)) >= 3]
-        if len(words) < 2 or len(t) > 150 or _is_label(t) or _is_code(t) or BOILERPLATE.search(_norm(t)):
+        words = [w for w in t.split() if len(re.findall(r"[A-Za-zÀ-ÿ]", w)) >= 4]
+        if (not words or len(re.findall(r"[A-Za-zÀ-ÿ]", t)) < 6 or len(t) > 150 or _is_label(t) or _is_code(t)
+                or BOILERPLATE.search(_norm(t)) or in_row(s)):
             continue
         out.append(s)
         if len(out) == n:
@@ -814,8 +820,15 @@ def _doc_title(pg, spans, ocr="", doc=True):
         # Titre = lignes en gras en haut de page + lignes plus grosses que le corps du texte (les deux:
         # le titre n'est pas toujours en gras, ni toujours le plus gros)
         body = _body_size(spans)
-        heads = _heading_spans(spans, pg.rect.height, body)
-        big = [s for s in prominent_spans(spans) if s["size"] >= 1.15 * body]
+        H = pg.rect.height
+        heads = _heading_spans(spans, H, body)
+        # lignes plus grosses que le corps: en haut de page (sinon titres de section d'un tableau), ou très grosses;
+        # si un titre en gras existe, seulement celles plus grosses que lui (titre non gras plus gros)
+        big = [s for s in prominent_spans(spans) if s["size"] >= 1.15 * body
+               and ((s["rect"].y0 + s["rect"].y1) / 2 <= 0.4 * H or s["size"] >= COVER_RATIO * body)]
+        if heads:
+            hmax = max(s["size"] for s in heads)
+            big = [s for s in big if s["size"] > 1.05 * hmax]
         if heads or big:
             both = sorted({id(s): s for s in heads + big}.values(), key=lambda s: (s["rect"].y0, s["rect"].x0))
             return _join(both), None, "texte en évidence"
@@ -871,8 +884,10 @@ def cartouche_title(pg, hint=""):
             return t, None, "texte en évidence"           # planning, tableau des révisions en bas de page de garde
         if mx_out >= 1.5 * mx_in and doc and mx_out >= 2.5 * mx_in:
             cover = t                                     # gros titre de page de garde + vrai cartouche: on garde les deux
-    if doc and n_lab < 2:
-        found = None                                      # document (mail, note): signature / mentions en bas de page
+    long_ratio = sum(1 for s in inside if len(s["text"]) >= 50) / max(1, len(inside))
+    if (doc and n_lab < 3) or long_ratio >= 0.15:
+        # pas un cartouche: signature / mentions d'un mail, colonne "Commentaires" d'un tableau (phrases longues)
+        found = None
     if found is None:
         return _doc_title(pg, spans, ocr, doc)
     ok_all, labels = [], []
