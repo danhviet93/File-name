@@ -1004,12 +1004,11 @@ def parse_name(stem):
     indice = rest.pop() if rest and len(rest[-1]) <= 2 else ""
     return [projet] + codes + [" ".join(rest), indice]
 
-# "Trouvé" en 1re colonne: filtrer Trouvé = 1 dans l'Inventaire donne les résultats de la recherche en texte
-# simple (copiable), alors que la feuille Recherche est faite de formules.
-HEADERS = (["Trouvé", "Nom", "Sous-dossier", "Projet"] + CODE_FIELDS +
-           ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)",
-            "Modifié le", "Titre PDF", "Titre détecté", "Origine titre", "Lien", "Chemin", "Lien relatif", "Index",
-            "N° trouvé"])
+# Inventaire: colonnes texte (copiables) d'abord, colonnes calculées (formules) à la fin.
+# Filtrer "Trouvé" = 1 donne les résultats de la feuille Recherche en texte simple.
+HEADERS = (["Titre détecté", "Chemin", "Lien", "Nom", "Sous-dossier", "Projet"] + CODE_FIELDS +
+           ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)", "Modifié le", "Titre PDF", "Origine titre",
+            "Trouvé", "Lien relatif", "Index", "N° trouvé"])
 C_LIEN = HEADERS.index("Lien") + 1
 C_CHEMIN = HEADERS.index("Chemin") + 1
 C_REL = HEADERS.index("Lien relatif") + 1   # chemin relatif au fichier Excel (liens courts: HYPERLINK limité à 255 car.)
@@ -1107,12 +1106,14 @@ def scan(root, pdfs, state, cancel):
         except Exception as e:
             txt = f"ERREUR: {e}"
         rel = os.path.relpath(p, root)                    # lien relatif au fichier Excel (enregistré dans root)
-        row = ([None, p.name, str(p.parent.relative_to(root))] + parsed[:1 + len(CODE_FIELDS) + 1] +
-               [parsed[-1], pages, round(st.st_size / 1048576, 2),
-                datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
-                title, txt, origine, "Ouvrir", str(p), rel,
-                search_index(f"{p.stem.replace('_', ' ')} {title} {txt}")])
-        ws.append([clean(v) for v in row])
+        vals = dict(zip(["Projet"] + CODE_FIELDS + ["Description (nom fichier)", "Indice"], parsed))
+        vals.update({"Titre détecté": txt, "Chemin": str(p), "Lien": "Ouvrir", "Nom": p.name,
+                     "Sous-dossier": str(p.parent.relative_to(root)), "Pages": pages,
+                     "Taille (Mo)": round(st.st_size / 1048576, 2),
+                     "Modifié le": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
+                     "Titre PDF": title, "Origine titre": origine, "Lien relatif": rel,
+                     "Index": search_index(f"{p.stem.replace('_', ' ')} {title} {txt}")})
+        ws.append([clean(vals.get(h)) for h in HEADERS])
         r = ws.max_row
         ws.cell(row=r, column=C_MATCH, value=match_formula(f"{L(C_INDEX)}{r}"))
         ws.cell(row=r, column=C_CNT, value=f"={L(C_MATCH)}{r}" if r == 2 else f"={L(C_CNT)}{r - 1}+{L(C_MATCH)}{r}")
