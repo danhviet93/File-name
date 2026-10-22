@@ -22,17 +22,22 @@ pymupdf.TOOLS.mupdf_display_errors(False)
 # ---- Détection du cartouche et extraction du titre ----
 TXT_FLAGS = (pymupdf.TEXT_PRESERVE_LIGATURES | pymupdf.TEXT_PRESERVE_WHITESPACE | pymupdf.TEXT_MEDIABOX_CLIP |
              getattr(pymupdf, "TEXT_CID_FOR_UNKNOWN_UNICODE", 0))   # comme le mode par défaut, mais SANS images (beaucoup plus rapide)
-ACCENTS = {"p": "é", "q": "è", "k": "â", "v": "î", "e": "É", "r": "ê", "ð": "²"}
+# Police sans table Unicode: code du caractère = n° de glyphe dans l'ordre standard Macintosh des polices
+# TrueType (3 = espace, 36 = A, 68 = a, 112 = é, 123 = ô...). Table complète (258 glyphes) à partir du n° 3.
+MAC_GLYPHS = ' !"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»…\xa0ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄¤‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔ\uf8ffÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇŁłŠšŽž¦ÐðÝýÞþ−×¹²³½¼¾₣ĞğİŞşĆćČčđ'
+ACCENTS = {"ð": "²"}   # exception observée sur des plans (m²)
 
 def _decode(t):
-    """Police sans table Unicode: les glyphes sont décalés de 29 (ex: '3/$1' = 'PLAN')."""
+    """Police sans table Unicode: les glyphes sont numérotés dans l'ordre Macintosh (ex: '3/$1' = 'PLAN')."""
     out = []
     for ch in t:
         o = ord(ch)
-        if 3 <= o <= 93:
-            out.append(chr(o + 29))
+        if ch in ACCENTS:
+            out.append(ACCENTS[ch])
+        elif 3 <= o < 3 + len(MAC_GLYPHS):
+            out.append(MAC_GLYPHS[o - 3])
         else:
-            out.append(ACCENTS.get(ch, ch))
+            out.append(ch)
     return "".join(out)
 
 _TESSDATA = []
@@ -913,10 +918,19 @@ def cartouche_title(pg, hint=""):
             alt = max(((_overlap(hint_t, _assemble(v)), _assemble(v)) for c, v in cells.items() if c), default=(0, ""))
             if alt[0] >= 0.5 and alt[0] > sc and len(hint_t) >= 2:
                 best_t, best_o = alt[1], "cartouche (proche nom fichier)"
-        parts = best_t.split(" | ")
-        first = next((i for i, x in enumerate(parts) if _overlap(hint_t, x) > 0), 0)
-        if first and _overlap(hint_t, " ".join(parts[first:])) >= _overlap(hint_t, best_t):
-            best_t = " | ".join(parts[first:])          # lignes au-dessus sans rapport (nom du projet, client...)
+    # Titre complet = toutes les lignes de la cellule du titre (aéroport, projet, type de plan, objet...):
+    # plus de mots-clés pour la recherche. Seulement si la cellule est bien délimitée (pas tout le cartouche).
+    parts = best_t.split(" | ")
+    cells = [s["cell"] for s in ok_all if s["text"] in parts and s["cell"]]
+    if cells:
+        c = max(set(cells), key=cells.count)
+        if sizes.get(c, 0) < 0.6 * box.get_area():
+            full = [s for s in ok_all if s["cell"] == c]
+            mx_c = max(s["size"] for s in full)
+            full.sort(key=lambda s: (round(s["rect"].y0 / (mx_c * 0.4)), s["rect"].x0))
+            t_full = _join(full)
+            if len(t_full) > len(best_t):
+                best_t = t_full
     if not best_t.strip():
         t = prominent_text(sp)
         return (t, box, "texte en évidence (à vérifier)" + ocr) if t else ("", box, "cartouche" + ocr)
@@ -971,10 +985,12 @@ def parse_name(stem):
     indice = rest.pop() if rest and len(rest[-1]) <= 2 else ""
     return [projet] + codes + [" ".join(rest), indice]
 
-HEADERS = (["Nom", "Sous-dossier", "Projet"] + CODE_FIELDS +
+# "Trouvé" en 1re colonne: filtrer Trouvé = 1 dans l'Inventaire donne les résultats de la recherche en texte
+# simple (copiable), alors que la feuille Recherche est faite de formules.
+HEADERS = (["Trouvé", "Nom", "Sous-dossier", "Projet"] + CODE_FIELDS +
            ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)",
             "Modifié le", "Titre PDF", "Titre détecté", "Origine titre", "Lien", "Chemin", "Lien relatif", "Index",
-            "Trouvé", "N° trouvé"])
+            "N° trouvé"])
 C_LIEN = HEADERS.index("Lien") + 1
 C_CHEMIN = HEADERS.index("Chemin") + 1
 C_REL = HEADERS.index("Lien relatif") + 1   # chemin relatif au fichier Excel (liens courts: HYPERLINK limité à 255 car.)
@@ -984,7 +1000,7 @@ C_CNT = HEADERS.index("N° trouvé") + 1       # compteur cumulé des lignes tro
 C_TEXTE = HEADERS.index("Titre détecté") + 1
 WIDTHS = {"Nom": 45, "Sous-dossier": 30, "Description (nom fichier)": 40,
           "Titre PDF": 25, "Titre détecté": 60, "Origine titre": 14, "Chemin": 40, "Lien": 9, "Index": 8,
-          "Ouvrir": 9, "Lien relatif": 30}
+          "Ouvrir": 9, "Lien relatif": 30, "Trouvé": 9}
 # Ordre des colonnes de la feuille Recherche: ce qui sert à retrouver le fichier d'abord
 SEARCH_COLS = (["Titre détecté", "Nom", "Chemin", "Sous-dossier", "Projet"] + CODE_FIELDS +
                ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)", "Modifié le", "Titre PDF",
@@ -1034,6 +1050,11 @@ def fallback_title(meta, stem, desc, kind="scan"):
     name = desc or stem
     return " ".join(name.replace("_", " ").split()), f"nom du fichier ({kind})"
 
+def search_index(t):
+    """Texte cherché par la feuille Recherche, + copie sans accents: 'controle' trouve aussi 'Contrôle'."""
+    plain = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
+    return t if plain == t else f"{t} {plain}"
+
 def scan(root, pdfs, state, cancel):
     """Analyse les PDF un par un et remplit le classeur Excel. state est lu par la fenêtre de progression."""
     wb = Workbook()
@@ -1066,11 +1087,11 @@ def scan(root, pdfs, state, cancel):
         except Exception as e:
             txt = f"ERREUR: {e}"
         rel = os.path.relpath(p, root)                    # lien relatif au fichier Excel (enregistré dans root)
-        row = ([p.name, str(p.parent.relative_to(root))] + parsed[:1 + len(CODE_FIELDS) + 1] +
+        row = ([None, p.name, str(p.parent.relative_to(root))] + parsed[:1 + len(CODE_FIELDS) + 1] +
                [parsed[-1], pages, round(st.st_size / 1048576, 2),
                 datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
                 title, txt, origine, "Ouvrir", str(p), rel,
-                f"{p.stem.replace('_', ' ')} {title} {txt}"])
+                search_index(f"{p.stem.replace('_', ' ')} {title} {txt}")])
         ws.append([clean(v) for v in row])
         r = ws.max_row
         ws.cell(row=r, column=C_MATCH, value=match_formula(f"{L(C_INDEX)}{r}"))
@@ -1093,7 +1114,6 @@ def build_sheets(wb, ws, n):
 
     ws.column_dimensions[L(C_REL)].hidden = True
 
-    ws.column_dimensions[L(C_MATCH)].hidden = True
     ws.column_dimensions[L(C_CNT)].hidden = True
     blue = PatternFill("solid", fgColor="9BC2E6")
     ws.conditional_formatting.add(f"{L(C_TEXTE)}2:{L(C_TEXTE)}{n + 1}",
