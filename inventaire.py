@@ -4,8 +4,8 @@ import pymupdf
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter as L
 from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.worksheet.formula import ArrayFormula
-from openpyxl.styles import Font, PatternFill
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 # Caractères interdits dans le XML d'Excel: contrôles, mais aussi U+FFFE/U+FFFF et "surrogates" isolés
@@ -835,11 +835,14 @@ def parse_name(stem):
 
 HEADERS = (["Nom", "Sous-dossier", "Projet"] + CODE_FIELDS +
            ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)",
-            "Modifié le", "Titre PDF", "Titre détecté", "Origine titre", "Lien", "Chemin", "Lien relatif", "Index"])
+            "Modifié le", "Titre PDF", "Titre détecté", "Origine titre", "Lien", "Chemin", "Lien relatif", "Index",
+            "Trouvé", "N° trouvé"])
 C_LIEN = HEADERS.index("Lien") + 1
 C_CHEMIN = HEADERS.index("Chemin") + 1
 C_REL = HEADERS.index("Lien relatif") + 1   # chemin relatif au fichier Excel (liens courts: HYPERLINK limité à 255 car.)
 C_INDEX = HEADERS.index("Index") + 1
+C_MATCH = HEADERS.index("Trouvé") + 1        # 1 si la ligne contient tous les mots-clés de Recherche!B1
+C_CNT = HEADERS.index("N° trouvé") + 1       # compteur cumulé des lignes trouvées (sert à les lister dans Recherche)
 C_TEXTE = HEADERS.index("Titre détecté") + 1
 WIDTHS = {"Nom": 45, "Sous-dossier": 30, "Description (nom fichier)": 40,
           "Titre PDF": 25, "Titre détecté": 60, "Origine titre": 14, "Chemin": 40, "Lien": 9, "Index": 8,
@@ -857,6 +860,22 @@ def list_pdfs(root):
                 out.append(pathlib.Path(dirpath) / fn)
     out.sort()
     return out
+
+# ---- Recherche par mots-clés: formules classiques (aucune formule matricielle, marche dans tout Excel) ----
+KW = "Recherche!$B$1"
+MAX_WORDS = 8
+# les mots de B1, un par élément (vides au-delà du nombre de mots): découpage par SUBSTITUE/STXT
+WORDS = (f'TRIM(MID(SUBSTITUTE(TRIM({KW})," ",REPT(" ",200)),'
+         f'{{{",".join(str(i * 200 + 1) for i in range(MAX_WORDS))}}},200))')
+
+def match_formula(cell):
+    """1 si la cellule contient tous les mots-clés (ordre libre), ou si la recherche est vide."""
+    return (f'=IF(TRIM({KW})="",1,--(SUMPRODUCT(({WORDS}<>"")*ISNUMBER(SEARCH({WORDS},{cell})))'
+            f'=SUMPRODUCT(--({WORDS}<>""))))')
+
+def highlight_formula(cell):
+    """Mise en forme conditionnelle: la cellule contient au moins un des mots-clés."""
+    return f'AND(TRIM({KW})<>"",SUMPRODUCT(({WORDS}<>"")*ISNUMBER(SEARCH({WORDS},{cell})))>0)'
 
 def scan(root, pdfs, state, cancel):
     """Analyse les PDF un par un et remplit le classeur Excel. state est lu par la fenêtre de progression."""
@@ -894,7 +913,10 @@ def scan(root, pdfs, state, cancel):
                 title, txt, origine, "Ouvrir", str(p), rel,
                 f"{p.stem.replace('_', ' ')} {title} {txt}"])
         ws.append([clean(v) for v in row])
-        c = ws.cell(row=ws.max_row, column=C_LIEN)
+        r = ws.max_row
+        ws.cell(row=r, column=C_MATCH, value=match_formula(f"{L(C_INDEX)}{r}"))
+        ws.cell(row=r, column=C_CNT, value=f"={L(C_MATCH)}{r}" if r == 2 else f"={L(C_CNT)}{r - 1}+{L(C_MATCH)}{r}")
+        c = ws.cell(row=r, column=C_LIEN)
         c.hyperlink = clean(link_target(rel))
         c.font = Font(color="0563C1", underline="single")
         n += 1
@@ -912,34 +934,60 @@ def build_sheets(wb, ws, n):
 
     ws.column_dimensions[L(C_REL)].hidden = True
 
-    # ---- Feuille de recherche par mots-clés (Excel 365) ----
-    # Colonne A = lien "Ouvrir", puis Titre détecté, Nom, Chemin... (ordre SEARCH_COLS)
+    ws.column_dimensions[L(C_MATCH)].hidden = True
+    ws.column_dimensions[L(C_CNT)].hidden = True
+    blue = PatternFill("solid", fgColor="9BC2E6")
+    ws.conditional_formatting.add(f"{L(C_TEXTE)}2:{L(C_TEXTE)}{n + 1}",
+                                  FormulaRule(formula=[highlight_formula(f"{L(C_TEXTE)}2")], fill=blue,
+                                              font=Font(bold=True)))
+
+    # ---- Feuille de recherche par mots-clés ----
+    # Ligne i = i-ème fichier trouvé (compteur cumulé de l'Inventaire, recherche dichotomique: rapide).
+    # Colonne A = lien "Ouvrir", puis Titre détecté, Nom, Chemin... (ordre SEARCH_COLS), colonne cachée = n° de ligne.
     rs = wb.create_sheet("Recherche", 0)
     rs["A1"] = "Mots-clés :"
-    rs["A1"].font = Font(bold=True)
-    rs["B1"].fill = PatternFill("solid", fgColor="FFF2CC")
+    rs["A1"].font = Font(bold=True, size=14, color="1F4E79")
+    rs["A1"].alignment = Alignment(horizontal="right", vertical="center")
+    box = rs["B1"]
+    box.fill = PatternFill("solid", fgColor="FFF2CC")
+    box.font = Font(bold=True, size=14, color="1F4E79")
+    box.alignment = Alignment(vertical="center")
+    thick = Side(style="thick", color="2F75B5")
+    box.border = Border(left=thick, right=thick, top=thick, bottom=thick)
+    rs.row_dimensions[1].height = 28
     rs["C1"] = "← un ou plusieurs mots (ordre libre), tous doivent être présents"
-    rs.cell(row=3, column=1, value="Ouvrir").font = Font(bold=True)
-    for i, h in enumerate(SEARCH_COLS, start=2):
-        rs.cell(row=3, column=i, value=h).font = Font(bold=True)
-    last = n + 1
-    rng = f"Inventaire!$A$2:${L(C_REL)}${last}"
-    mots = '_xlfn.TEXTSPLIT(TRIM($B$1)," ")'
-    cols = ",".join(str(HEADERS.index(h) + 1) for h in SEARCH_COLS)
-    formula = (
-        f'=IFERROR(_xlfn.CHOOSECOLS(_xlfn._xlws.FILTER(IF({rng}="","",{rng}),'
-        f'MMULT(--ISNUMBER(SEARCH({mots},Inventaire!${L(C_INDEX)}$2:${L(C_INDEX)}${last})),'
-        f'TRANSPOSE(--({mots}<>"")))=COLUMNS({mots})),{cols}),"")'
-    )
-    c_rel = len(SEARCH_COLS) + 1                     # colonne "Lien relatif" dans Recherche
-    rs["B4"] = ArrayFormula(f"B4:{L(c_rel)}{3 + n}", formula)
-    for r in range(4, 4 + n):
-        c = rs.cell(row=r, column=1, value=f'=IF({L(c_rel)}{r}="","",HYPERLINK({L(c_rel)}{r},"Ouvrir"))')
-        c.font = Font(color="0563C1", underline="single")
-    rs.column_dimensions["A"].width = WIDTHS["Ouvrir"]
+    rs["C1"].font = Font(italic=True, color="595959")
+    total = f"Inventaire!${L(C_CNT)}${n + 1}"
+    rs["B2"] = f'={total}&" fichier(s) trouvé(s) sur {n}"'
+    rs["B2"].font = Font(bold=True, color="2F75B5")
+    head = PatternFill("solid", fgColor="1F4E79")
+    for i, h in enumerate(["Ouvrir"] + SEARCH_COLS, start=1):
+        c = rs.cell(row=3, column=i, value=h)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = head
+    c_row = len(SEARCH_COLS) + 2                      # colonne cachée: n° de ligne dans l'Inventaire
+    rs.cell(row=3, column=c_row, value="Ligne")
+    cnt = f"Inventaire!${L(C_CNT)}$2:${L(C_CNT)}${n + 1}"
+    rel_col = f"Inventaire!${L(C_REL)}$2:${L(C_REL)}${n + 1}"
+    link = Font(color="0563C1", underline="single")
+    for i in range(1, n + 1):
+        r = 3 + i
+        h = f"${L(c_row)}{r}"
+        rs.cell(row=r, column=c_row, value=f'=IF({i}>{total},"",IFERROR(MATCH({i}-0.5,{cnt},1),0)+1)')
+        c = rs.cell(row=r, column=1, value=f'=IF({h}="","",HYPERLINK(INDEX({rel_col},{h}),"Ouvrir"))')
+        c.font = link
+        for j, name in enumerate(SEARCH_COLS, start=2):
+            k = HEADERS.index(name) + 1
+            src = f"Inventaire!${L(k)}$2:${L(k)}${n + 1}"
+            rs.cell(row=r, column=j, value=f'=IF({h}="","",IF(INDEX({src},{h})="","",INDEX({src},{h})))')
+    rs.column_dimensions["A"].width = WIDTHS["Ouvrir"] + 4
     for i, h in enumerate(SEARCH_COLS, start=2):
         rs.column_dimensions[L(i)].width = WIDTHS.get(h, 12)
-    rs.column_dimensions[L(c_rel)].hidden = True
+    rs.column_dimensions["B"].width = max(WIDTHS["Titre détecté"], 60)
+    rs.column_dimensions[L(len(SEARCH_COLS) + 1)].hidden = True   # Lien relatif
+    rs.column_dimensions[L(c_row)].hidden = True
+    rs.conditional_formatting.add(f"B4:B{n + 3}",
+                                  FormulaRule(formula=[highlight_formula("B4")], fill=blue, font=Font(bold=True)))
     rs.freeze_panes = "B4"
 
 def link_target(rel):
