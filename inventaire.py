@@ -835,13 +835,19 @@ def parse_name(stem):
 
 HEADERS = (["Nom", "Sous-dossier", "Projet"] + CODE_FIELDS +
            ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)",
-            "Modifié le", "Titre PDF", "Titre détecté", "Origine titre", "Lien", "Chemin", "Index"])
+            "Modifié le", "Titre PDF", "Titre détecté", "Origine titre", "Lien", "Chemin", "Lien relatif", "Index"])
 C_LIEN = HEADERS.index("Lien") + 1
 C_CHEMIN = HEADERS.index("Chemin") + 1
+C_REL = HEADERS.index("Lien relatif") + 1   # chemin relatif au fichier Excel (liens courts: HYPERLINK limité à 255 car.)
 C_INDEX = HEADERS.index("Index") + 1
 C_TEXTE = HEADERS.index("Titre détecté") + 1
 WIDTHS = {"Nom": 45, "Sous-dossier": 30, "Description (nom fichier)": 40,
-          "Titre PDF": 25, "Titre détecté": 60, "Origine titre": 14, "Chemin": 40, "Lien": 9, "Index": 8}
+          "Titre PDF": 25, "Titre détecté": 60, "Origine titre": 14, "Chemin": 40, "Lien": 9, "Index": 8,
+          "Ouvrir": 9, "Lien relatif": 30}
+# Ordre des colonnes de la feuille Recherche: ce qui sert à retrouver le fichier d'abord
+SEARCH_COLS = (["Titre détecté", "Nom", "Chemin", "Sous-dossier", "Projet"] + CODE_FIELDS +
+               ["Description (nom fichier)", "Indice", "Pages", "Taille (Mo)", "Modifié le", "Titre PDF",
+                "Origine titre", "Lien relatif"])
 
 def list_pdfs(root):
     out = []
@@ -881,14 +887,15 @@ def scan(root, pdfs, state, cancel):
             d.close()
         except Exception as e:
             txt = f"ERREUR: {e}"
+        rel = os.path.relpath(p, root)                    # lien relatif au fichier Excel (enregistré dans root)
         row = ([p.name, str(p.parent.relative_to(root))] + parsed[:1 + len(CODE_FIELDS) + 1] +
                [parsed[-1], pages, round(st.st_size / 1048576, 2),
                 datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
-                title, txt, origine, "Ouvrir", str(p),
+                title, txt, origine, "Ouvrir", str(p), rel,
                 f"{p.stem.replace('_', ' ')} {title} {txt}"])
         ws.append([clean(v) for v in row])
         c = ws.cell(row=ws.max_row, column=C_LIEN)
-        c.hyperlink = clean(str(p))
+        c.hyperlink = clean(link_target(rel))
         c.font = Font(color="0563C1", underline="single")
         n += 1
         state["i"] = n
@@ -903,31 +910,51 @@ def build_sheets(wb, ws, n):
         ws.column_dimensions[L(i)].width = WIDTHS.get(h, 12)
     ws.column_dimensions[L(C_INDEX)].hidden = True
 
+    ws.column_dimensions[L(C_REL)].hidden = True
+
     # ---- Feuille de recherche par mots-clés (Excel 365) ----
+    # Colonne A = lien "Ouvrir", puis Titre détecté, Nom, Chemin... (ordre SEARCH_COLS)
     rs = wb.create_sheet("Recherche", 0)
     rs["A1"] = "Mots-clés :"
     rs["A1"].font = Font(bold=True)
     rs["B1"].fill = PatternFill("solid", fgColor="FFF2CC")
     rs["C1"] = "← un ou plusieurs mots (ordre libre), tous doivent être présents"
-    for i, h in enumerate(HEADERS[:C_CHEMIN], start=1):
+    rs.cell(row=3, column=1, value="Ouvrir").font = Font(bold=True)
+    for i, h in enumerate(SEARCH_COLS, start=2):
         rs.cell(row=3, column=i, value=h).font = Font(bold=True)
-    C_OUVRIR = C_CHEMIN + 1
-    rs.cell(row=3, column=C_OUVRIR, value="Ouvrir").font = Font(bold=True)
     last = n + 1
+    rng = f"Inventaire!$A$2:${L(C_REL)}${last}"
     mots = '_xlfn.TEXTSPLIT(TRIM($B$1)," ")'
+    cols = ",".join(str(HEADERS.index(h) + 1) for h in SEARCH_COLS)
     formula = (
-        f'=IFERROR(_xlfn._xlws.FILTER(IF(Inventaire!$A$2:${L(C_CHEMIN)}${last}="","",Inventaire!$A$2:${L(C_CHEMIN)}${last}),'
+        f'=IFERROR(_xlfn.CHOOSECOLS(_xlfn._xlws.FILTER(IF({rng}="","",{rng}),'
         f'MMULT(--ISNUMBER(SEARCH({mots},Inventaire!${L(C_INDEX)}$2:${L(C_INDEX)}${last})),'
-        f'TRANSPOSE(--({mots}<>"")))=COLUMNS({mots}),""),"")'
+        f'TRANSPOSE(--({mots}<>"")))=COLUMNS({mots})),{cols}),"")'
     )
-    rs["A4"] = ArrayFormula(f"A4:{L(C_CHEMIN)}{3 + n}", formula)
+    c_rel = len(SEARCH_COLS) + 1                     # colonne "Lien relatif" dans Recherche
+    rs["B4"] = ArrayFormula(f"B4:{L(c_rel)}{3 + n}", formula)
     for r in range(4, 4 + n):
-        rs.cell(row=r, column=C_OUVRIR,
-                value=f'=IF({L(C_CHEMIN)}{r}="","",HYPERLINK({L(C_CHEMIN)}{r},"Ouvrir"))')
-    for i, h in enumerate(HEADERS[:C_CHEMIN], start=1):
+        c = rs.cell(row=r, column=1, value=f'=IF({L(c_rel)}{r}="","",HYPERLINK({L(c_rel)}{r},"Ouvrir"))')
+        c.font = Font(color="0563C1", underline="single")
+    rs.column_dimensions["A"].width = WIDTHS["Ouvrir"]
+    for i, h in enumerate(SEARCH_COLS, start=2):
         rs.column_dimensions[L(i)].width = WIDTHS.get(h, 12)
-    rs.column_dimensions[L(C_LIEN)].hidden = True
-    rs.freeze_panes = "A4"
+    rs.column_dimensions[L(c_rel)].hidden = True
+    rs.freeze_panes = "B4"
+
+def link_target(rel):
+    """Cible de lien hypertexte comme Excel l'écrit: '/' et espaces, '#' et '%' encodés ('#' = ancre sinon)."""
+    return rel.replace("\\", "/").replace("%", "%25").replace(" ", "%20").replace("#", "%23")
+
+def absolute_links(wb, root):
+    """Excel enregistré ailleurs que dans le dossier analysé (repli): les liens relatifs ne marcheraient plus."""
+    ws = wb["Inventaire"]
+    for r in range(2, ws.max_row + 1):
+        c = ws.cell(row=r, column=C_REL)
+        if c.value and not os.path.isabs(c.value):
+            p = root / c.value
+            c.value = clean(str(p))
+            ws.cell(row=r, column=C_LIEN).hyperlink = clean(p.as_uri())
 
 def default_out(root):
     """Fichier Excel enregistré dans le dossier analysé, nommé comme ce dossier (ex: D:\\Projet\\DCE -> DCE.xlsx)."""
@@ -940,6 +967,8 @@ def save_workbook(wb, out, root):
     for target in [out, stamped, home / "OneDrive" / "Desktop" / out.name, home / "Desktop" / out.name,
                    home / "Documents" / out.name, home / out.name]:
         try:
+            if target.parent.resolve() != root.resolve():
+                absolute_links(wb, root)
             wb.save(target)
             return target
         except OSError:          # PermissionError, FileNotFoundError...
