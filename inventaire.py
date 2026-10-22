@@ -35,20 +35,65 @@ def _decode(t):
             out.append(ACCENTS.get(ch, ch))
     return "".join(out)
 
+_TESSDATA = []
+
+def _tessdata():
+    """Dossier tessdata de Tesseract (None si absent). Sous Windows, Tesseract n'est souvent pas dans le PATH:
+    on regarde aussi les dossiers d'installation habituels."""
+    if not _TESSDATA:
+        found = None
+        try:
+            found = pymupdf.get_tessdata()
+        except Exception:
+            cands = [os.environ.get("TESSDATA_PREFIX", "")]
+            for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                         os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+                cands.append(os.path.join(base, "Tesseract-OCR", "tessdata"))
+            found = next((c for c in cands if c and os.path.isfile(os.path.join(c, "eng.traineddata"))), None)
+        _TESSDATA.append(found)
+    return _TESSDATA[0]
+
 def _ocr_textpage(pg):
     """Page sans texte (scan, texte vectorisé): OCR si Tesseract est installé, sinon None."""
-    try:
-        pymupdf.get_tessdata()
-    except Exception:
+    td = _tessdata()
+    if not td:
         return None
     W, H = pg.rect.width, pg.rect.height
     dpi = int(max(72, min(200, 72 * (30e6 / max(1.0, W * H)) ** 0.5)))   # max ~30 Mpx (A0 -> ~140 dpi)
-    for lang in ("fra+eng", "fra", "eng"):
+    langs = [l for l in ("fra+eng", "fra", "eng")
+             if all(os.path.isfile(os.path.join(td, x + ".traineddata")) for x in l.split("+"))]
+    for lang in langs:
         try:
-            return pg.get_textpage_ocr(flags=TXT_FLAGS, language=lang, dpi=dpi, full=True)
+            return pg.get_textpage_ocr(flags=TXT_FLAGS, language=lang, dpi=dpi, full=True, tessdata=td)
         except Exception:
             continue
     return None
+
+def _ocr_ok(t):
+    """Ligne OCR plausible: au moins un vrai mot (>= 4 lettres) et surtout des lettres (pas du bruit de tampon/QR code)."""
+    chars = [c for c in t if not c.isspace()]
+    letters = [c for c in chars if c.isalpha()]
+    return (len(letters) >= 6 and len(letters) >= 0.6 * len(chars)
+            and any(len(w) >= 4 and w.isalpha() for w in re.findall(r"[^\W\d_]+", t)))
+
+def ocr_title(spans, W, H):
+    """Page scannée: les tailles de police de l'OCR ne sont pas fiables. Titre = lignes centrées en haut de page
+    (présentation habituelle d'un titre), consécutives; à défaut, les lignes en évidence."""
+    good = [s for s in spans if s["dir"][0] > 0.7 and _ocr_ok(s["text"]) and not _is_label(s["text"])
+            and not BOILERPLATE.search(_norm(s["text"]))]
+    cen = sorted((s for s in good if abs((s["rect"].x0 + s["rect"].x1) / 2 - W / 2) <= 0.05 * W
+                  and s["rect"].y0 <= 0.45 * H and s["rect"].width < 0.95 * W), key=lambda s: s["rect"].y0)
+    out = []
+    for s in cen:
+        if out and s["rect"].y0 - out[-1]["rect"].y1 > 3 * max(out[-1]["rect"].height, s["rect"].height):
+            break                                     # grand vide: fin du bloc de titre
+        out.append(s)
+        if len(out) == 4:
+            break
+    if out:
+        return " | ".join(s["text"] for s in out)[:400]
+    return prominent_text(good)
 
 def _merge_line(items, vx, vy):
     """Recolle les morceaux d'une même ligne (police/graisse différente, mot isolé) si aucun trait ne les sépare.
@@ -708,6 +753,10 @@ def cartouche_title(pg, hint=""):
             ocr = " (OCR)"
     found = find_cartouche(pg, segs, spans, rects)
     doc = n_items <= DOC_MAX_ITEMS
+    if found is None and ocr:
+        t = ocr_title(spans, pg.rect.width, pg.rect.height)
+        if t:
+            return t, None, "texte OCR (à vérifier)"
     if found is None:
         if doc and not ocr:                               # document: pas de cartouche
             body = _body_size(spans)
