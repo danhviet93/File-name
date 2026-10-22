@@ -926,6 +926,17 @@ def highlight_formula(cell):
     """Mise en forme conditionnelle: la cellule contient au moins un des mots-clés."""
     return f'AND(TRIM({KW})<>"",SUMPRODUCT(({WORDS}<>"")*ISNUMBER(SEARCH({WORDS},{cell})))>0)'
 
+def fallback_title(meta, stem, desc):
+    """PDF sans texte (scan) et pas d'OCR: titre des propriétés du PDF s'il a un sens, sinon le nom du fichier."""
+    t = re.sub(r"^(microsoft (word|excel|powerpoint)|word|excel)\s*-\s*", "", (meta or "").strip(), flags=re.I)
+    t = re.sub(r"\.(docx?|xlsx?|pptx?|pdf|dwg)$", "", t, flags=re.I).strip()
+    same = _norm(t).replace("_", " ").strip() in (_norm(stem).replace("_", " "), "")
+    words = [w for w in t.split() if len(re.findall(r"[A-Za-zÀ-ÿ]", w)) >= 3]
+    if t and not same and len(words) >= 2 and not _is_code(t):     # vraie phrase, pas "scan_ADP_001"
+        return t, "propriétés PDF (scan)"
+    name = desc or stem
+    return " ".join(name.replace("_", " ").split()), "nom du fichier (scan)"
+
 def scan(root, pdfs, state, cancel):
     """Analyse les PDF un par un et remplit le classeur Excel. state est lu par la fenêtre de progression."""
     wb = Workbook()
@@ -950,8 +961,8 @@ def scan(root, pdfs, state, cancel):
                 t2, _b2, o2 = cartouche_title(d[1], hint)  # page de garde vide ou sans cartouche: on essaie la page 2
                 if t2 and o2 not in ("non détecté", "aucun texte"):
                     txt, origine = t2, o2 + " p.2"
-            if not txt:
-                txt = "(aucun texte)"
+            if origine.startswith("aucun texte") or not txt:
+                txt, origine = fallback_title(title, p.stem, parsed[1 + len(CODE_FIELDS)])
             d.close()
         except Exception as e:
             txt = f"ERREUR: {e}"
