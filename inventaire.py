@@ -1105,9 +1105,9 @@ def scan(root, pdfs, state, cancel):
             d.close()
         except Exception as e:
             txt = f"ERREUR: {e}"
-        rel = os.path.relpath(p, root)                    # lien relatif au fichier Excel (enregistré dans root)
+        rel, label = link_for(p, root)
         vals = dict(zip(["Projet"] + CODE_FIELDS + ["Description (nom fichier)", "Indice"], parsed))
-        vals.update({"Titre détecté": txt, "Chemin": str(p), "Lien": "Ouvrir", "Nom": p.name,
+        vals.update({"Titre détecté": txt, "Chemin": str(p), "Nom": p.name,
                      "Sous-dossier": str(p.parent.relative_to(root)), "Pages": pages,
                      "Taille (Mo)": round(st.st_size / 1048576, 2),
                      "Modifié le": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
@@ -1117,8 +1117,8 @@ def scan(root, pdfs, state, cancel):
         r = ws.max_row
         ws.cell(row=r, column=C_MATCH, value=match_formula(f"{L(C_INDEX)}{r}"))
         ws.cell(row=r, column=C_CNT, value=f"={L(C_MATCH)}{r}" if r == 2 else f"={L(C_CNT)}{r - 1}+{L(C_MATCH)}{r}")
-        c = ws.cell(row=r, column=C_LIEN)
-        c.hyperlink = clean(link_target(rel))
+        # lien par formule LIEN_HYPERTEXTE: chemin Windows tel quel (accents, &, + sans encodage d'URL)
+        c = ws.cell(row=r, column=C_LIEN, value=f'=HYPERLINK({L(C_REL)}{r},"{label}")')
         c.font = Font(color="0563C1", underline="single")
         n += 1
         state["i"] = n
@@ -1169,6 +1169,7 @@ def build_sheets(wb, ws, n):
     rs.cell(row=3, column=c_row, value="Ligne")
     cnt = f"Inventaire!${L(C_CNT)}$2:${L(C_CNT)}${n + 1}"
     rel_col = f"Inventaire!${L(C_REL)}$2:${L(C_REL)}${n + 1}"
+    lien_col = f"Inventaire!${L(C_LIEN)}$2:${L(C_LIEN)}${n + 1}"     # libellé "Ouvrir" / "Ouvrir dossier"
     link = Font(color="0563C1", underline="single")
     for i in range(1, n + 1):
         r = 3 + i
@@ -1176,7 +1177,8 @@ def build_sheets(wb, ws, n):
         rs.cell(row=r, column=c_row, value=f'=IF({i}>{total},"",IFERROR(MATCH({i}-0.5,{cnt},1),0)+1)')
         for j, name in enumerate(SEARCH_COLS, start=1):
             if name == "Ouvrir":
-                c = rs.cell(row=r, column=j, value=f'=IF({h}="","",HYPERLINK(INDEX({rel_col},{h}),"Ouvrir"))')
+                c = rs.cell(row=r, column=j,
+                            value=f'=IF({h}="","",HYPERLINK(INDEX({rel_col},{h}),INDEX({lien_col},{h})))')
                 c.font = link
                 continue
             k = HEADERS.index(name) + 1
@@ -1191,9 +1193,30 @@ def build_sheets(wb, ws, n):
                                   FormulaRule(formula=[highlight_formula("A4")], fill=blue, font=Font(bold=True)))
     rs.freeze_panes = "B4"
 
-def link_target(rel):
-    """Cible de lien hypertexte comme Excel l'écrit: '/' et espaces, '#' et '%' encodés ('#' = ancre sinon)."""
-    return rel.replace("\\", "/").replace("%", "%25").replace(" ", "%20").replace("#", "%23")
+MAX_PATH = 259     # Windows: au-delà, Excel / Acrobat n'ouvrent en général pas le fichier
+
+def short_path(path):
+    """Chemin court Windows 8.3 (H:\\2457-R~1\\...) pour les chemins trop longs; None si indisponible
+    (hors Windows, ou noms courts désactivés sur le disque, fréquent sur les lecteurs réseau)."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW("\\\\?\\" + str(path), buf, 32768)
+        sp = buf.value[4:] if 0 < n < 32768 and buf.value.startswith("\\\\?\\") else None
+        return sp if sp and len(sp) < len(str(path)) else None
+    except Exception:
+        return None
+
+def link_for(p, root):
+    """Cible du lien "Ouvrir" + libellé. Relatif au fichier Excel (enregistré dans root) si le chemin complet tient
+    dans la limite Windows; sinon chemin court 8.3; sinon on ouvre le dossier du fichier."""
+    rel = os.path.relpath(p, root)
+    if len(str(p)) <= MAX_PATH:
+        return rel, "Ouvrir"
+    sp = short_path(p)
+    if sp and len(sp) <= 255:                         # LIEN_HYPERTEXTE: 255 car. max
+        return sp, "Ouvrir"
+    return os.path.relpath(p.parent, root), "Ouvrir dossier"
 
 def absolute_links(wb, root):
     """Excel enregistré ailleurs que dans le dossier analysé (repli): les liens relatifs ne marcheraient plus."""
@@ -1201,9 +1224,7 @@ def absolute_links(wb, root):
     for r in range(2, ws.max_row + 1):
         c = ws.cell(row=r, column=C_REL)
         if c.value and not os.path.isabs(c.value):
-            p = root / c.value
-            c.value = clean(str(p))
-            ws.cell(row=r, column=C_LIEN).hyperlink = clean(p.as_uri())
+            c.value = clean(str(root / c.value))          # la formule de la colonne Lien suit cette cellule
 
 def default_out(root):
     """Fichier Excel enregistré dans le dossier analysé, nommé comme ce dossier (ex: D:\\Projet\\DCE -> DCE.xlsx)."""
