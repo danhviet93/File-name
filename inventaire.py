@@ -1081,6 +1081,7 @@ def scan(root, pdfs, state, cancel):
     ws = wb.active
     ws.title = "Inventaire"
     ws.append(HEADERS)
+    prepare_shortcuts(root)
     n = 0
     for p in pdfs:
         if cancel.is_set():
@@ -1106,7 +1107,7 @@ def scan(root, pdfs, state, cancel):
             d.close()
         except Exception as e:
             txt = f"ERREUR: {e}"
-        rel, label = link_for(p, root)
+        rel, label = link_for(p, root, n + 1)
         vals = dict(zip(["Projet"] + CODE_FIELDS + ["Description (nom fichier)", "Indice"], parsed))
         vals.update({"Titre détecté": txt, "Chemin": str(p), "Nom": p.name,
                      "Sous-dossier": str(p.parent.relative_to(root)), "Pages": pages,
@@ -1252,14 +1253,47 @@ def short_path(path):
     except Exception:
         return None
 
-def link_for(p, root):
+SHORTCUTS = "_liens"   # dossier (caché) des raccourcis vers les fichiers aux chemins trop longs pour Excel
+
+def prepare_shortcuts(root):
+    """Vide le dossier des raccourcis d'une analyse précédente (seulement nos fichiers .url)."""
+    d = root / SHORTCUTS
+    if d.is_dir():
+        for f in d.glob("*.url"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+def make_shortcut(p, root, num):
+    """Raccourci Windows (.url) au nom court vers p: Excel ouvre le raccourci (chemin court), Windows ouvre le PDF.
+    Retourne le chemin relatif du raccourci, ou None si impossible (dossier en lecture seule...)."""
+    d = root / SHORTCUTS
+    try:
+        new = not d.is_dir()
+        d.mkdir(exist_ok=True)
+        if new and os.name == "nt":
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(str(d), 2)        # dossier caché
+        f = d / f"{num:05d}.url"
+        f.write_text(f"[InternetShortcut]\r\nURL={p.as_uri()}\r\n", encoding="ascii")
+        rel = os.path.relpath(f, root)
+        return rel if _link_len(f) <= EXCEL_LINK_MAX else None
+    except (OSError, ValueError, UnicodeEncodeError):
+        return None
+
+def link_for(p, root, num=0):
     """Cible du lien "Ouvrir" + libellé. Relatif au fichier Excel (enregistré dans root) si l'adresse complète tient
-    dans la limite d'Excel; sinon chemin court 8.3; sinon le dossier du fichier (ou un dossier parent) qui y tient."""
+    dans la limite d'Excel; sinon chemin court 8.3; sinon raccourci .url au nom court; en dernier recours le dossier
+    du fichier (ou un dossier parent) qui tient dans la limite."""
     if _link_len(p) <= EXCEL_LINK_MAX:
         return os.path.relpath(p, root), "Ouvrir"
     sp = short_path(p)
     if sp and _link_len(sp) <= EXCEL_LINK_MAX:
         return sp, "Ouvrir"
+    sc = make_shortcut(p, root, num)
+    if sc:
+        return sc, "Ouvrir"
     d = p.parent
     while _link_len(d) > EXCEL_LINK_MAX and d != root and d.parent != d:
         d = d.parent
