@@ -4,6 +4,7 @@ import pymupdf
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter as L
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.filters import AutoFilter, FilterColumn, Filters
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -1192,6 +1193,44 @@ def build_sheets(wb, ws, n):
     rs.conditional_formatting.add(f"A4:A{n + 3}",
                                   FormulaRule(formula=[highlight_formula("A4")], fill=blue, font=Font(bold=True)))
     rs.freeze_panes = "B4"
+
+    # ---- Feuille Résultats: même liste que Recherche, mais en texte simple (copiable) ----
+    # Une feuille de texte ne se met pas à jour seule: filtre "Trouvé = 1" déjà posé, à réappliquer (Ctrl+Alt+L)
+    # après avoir changé les mots-clés. Seuls "Ouvrir" (lien) et "Trouvé" sont des formules.
+    res = wb.create_sheet("Résultats", 1)
+    res["A1"] = "Résultats en texte (copiable) — mots-clés :"
+    res["A1"].font = Font(bold=True, size=12, color="1F4E79")
+    res["A1"].alignment = Alignment(horizontal="right")
+    res["B1"] = '=IF(TRIM(Recherche!$B$1)="","(tous les fichiers)",Recherche!$B$1)'
+    res["B1"].font = Font(bold=True, size=12, color="2F75B5")
+    res["A2"] = ("Après avoir changé les mots-clés dans Recherche : Ctrl+Alt+L "
+                 "(ou Données > Réappliquer) pour mettre la liste à jour.")
+    res["A2"].font = Font(italic=True, color="C00000")
+    cols = SEARCH_COLS + ["Trouvé"]
+    for j, name in enumerate(cols, start=1):
+        res.cell(row=3, column=j, value=name)
+    for r in range(2, n + 2):                        # ligne r de l'Inventaire -> ligne r + 2 ici
+        for j, name in enumerate(cols, start=1):
+            if name == "Ouvrir":
+                c = res.cell(row=r + 2, column=j,
+                             value=f"=HYPERLINK(Inventaire!${L(C_REL)}{r},Inventaire!${L(C_LIEN)}{r})")
+                c.font = link
+            elif name == "Trouvé":
+                res.cell(row=r + 2, column=j, value=f"=Inventaire!${L(C_MATCH)}{r}")
+            else:
+                res.cell(row=r + 2, column=j, value=ws.cell(row=r, column=HEADERS.index(name) + 1).value)
+    ref = f"A3:{L(len(cols))}{n + 3}"
+    tab = Table(displayName="Resultats", ref=ref)
+    tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+    tab.autoFilter = AutoFilter(ref=ref, filterColumn=[FilterColumn(colId=len(cols) - 1, filters=Filters(filter=["1"]))])
+    res.add_table(tab)
+    for j, name in enumerate(cols, start=1):
+        res.column_dimensions[L(j)].width = WIDTHS.get(name, 12)
+    res.column_dimensions["A"].width = max(WIDTHS["Titre détecté"], 60)
+    res.column_dimensions["B"].width = 60
+    res.conditional_formatting.add(f"A4:A{n + 3}",
+                                   FormulaRule(formula=[highlight_formula("A4")], fill=blue, font=Font(bold=True)))
+    res.freeze_panes = "A4"
 
 MAX_PATH = 259     # Windows: au-delà, Excel / Acrobat n'ouvrent en général pas le fichier
 
