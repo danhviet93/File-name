@@ -1232,7 +1232,13 @@ def build_sheets(wb, ws, n):
                                    FormulaRule(formula=[highlight_formula("A4")], fill=blue, font=Font(bold=True)))
     res.freeze_panes = "A4"
 
-MAX_PATH = 259     # Windows: au-delà, Excel / Acrobat n'ouvrent en général pas le fichier
+# Excel n'ouvre pas un lien dont l'adresse encodée (espace -> %20, é -> %C3%A9) dépasse 218 caractères
+# ("Une erreur inattendue s'est produite"). Constaté sur 07-AVANT-PROJET: <= 207 ok, >= 227 en erreur.
+EXCEL_LINK_MAX = 218
+
+def _link_len(path):
+    import urllib.parse
+    return len(urllib.parse.quote(str(path).replace("\\", "/"), safe="/:"))
 
 def short_path(path):
     """Chemin court Windows 8.3 (H:\\2457-R~1\\...) pour les chemins trop longs; None si indisponible
@@ -1247,15 +1253,17 @@ def short_path(path):
         return None
 
 def link_for(p, root):
-    """Cible du lien "Ouvrir" + libellé. Relatif au fichier Excel (enregistré dans root) si le chemin complet tient
-    dans la limite Windows; sinon chemin court 8.3; sinon on ouvre le dossier du fichier."""
-    rel = os.path.relpath(p, root)
-    if len(str(p)) <= MAX_PATH:
-        return rel, "Ouvrir"
+    """Cible du lien "Ouvrir" + libellé. Relatif au fichier Excel (enregistré dans root) si l'adresse complète tient
+    dans la limite d'Excel; sinon chemin court 8.3; sinon le dossier du fichier (ou un dossier parent) qui y tient."""
+    if _link_len(p) <= EXCEL_LINK_MAX:
+        return os.path.relpath(p, root), "Ouvrir"
     sp = short_path(p)
-    if sp and len(sp) <= 255:                         # LIEN_HYPERTEXTE: 255 car. max
+    if sp and _link_len(sp) <= EXCEL_LINK_MAX:
         return sp, "Ouvrir"
-    return os.path.relpath(p.parent, root), "Ouvrir dossier"
+    d = p.parent
+    while _link_len(d) > EXCEL_LINK_MAX and d != root and d.parent != d:
+        d = d.parent
+    return os.path.relpath(d, root), "Ouvrir dossier"
 
 def absolute_links(wb, root):
     """Excel enregistré ailleurs que dans le dossier analysé (repli): les liens relatifs ne marcheraient plus."""
